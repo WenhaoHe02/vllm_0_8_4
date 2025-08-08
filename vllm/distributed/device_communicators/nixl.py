@@ -79,10 +79,10 @@ class DynamoNixlConnector:
         self._tp_size[engine_id] = vllm_config.parallel_config.tensor_parallel_size
         self._is_mla = "deepseek" in vllm_config.model_config.architectures[0].lower()
 
-        self._is_leader = None # use this when prfill tp size > decode tp size
-        self._merge_buffers = None # use this when prfill tp size > decode tp size and _is_leader
         self.block_size = None
         self.head_dim = None
+
+        self._downscale_info = {}
 
     @property
     def agent_name(self):
@@ -337,8 +337,13 @@ class DynamoNixlConnector:
 
         if len(local_block_ids) == 0:
             logger.debug("No blocks to write")
-            for i in range(tp_multiplier):
-                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i], notify_msg)
+            info = self._downscale_info.get(dst_engine_id)
+            if info is not None:
+                rr = info["remote_rank"]
+                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_msg)
+            else:
+                for i in range(tp_multiplier):
+                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i], notify_msg)
             return
         
         start_time = time.perf_counter()
@@ -400,70 +405,31 @@ class DynamoNixlConnector:
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
         tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
         if tp_multiplier == 0 and not self._is_mla:
-            group_size =  self._tp_size[self.engine_id] // self._tp_size[engine_id]
-            self._is_leader = (self.rank % group_size == 0)
-            if self._is_leader:
-                seg_len = self.block_len
-                local_tp = self._tp_size[self.engine_id]
-                remote_rank = self.rank // group_size
-                for r in range(local_tp):
-                    if r == self.rank:
-                        continue
-                    blocks = []
-                    for layer in range(self.num_layers):
-                        for base in self.kv_caches_base_addr[self.engine_id][layer]:
-                            for bid in range(self.num_blocks):
-                                blocks.append((base + bid * seg_len, seg_len, r))
-                    desc = self.nixl_wrapper.get_xfer_descs(blocks, "VRAM")
-                    self.prefill_dst_xfer_side_handles[engine_id][r] = self.nixl_wrapper.prep_xfer_dlist(agent_names[r], desc)
+            group_size = self._tp_size[self.engine_id] // self._tp_size[engine_id]
+            remote_rank = self.rank // group_size
+            seg_len = self.block_len
+            full_len = seg_len * group_size
+            peer_offset = (self.rank % group_size) * seg_len
+            self._downscale_info[engine_id] = {"group_size": group_size, "remote_rank": remote_rank}
+            src_blocks = []
+            for layer in range(self.num_layers):
+                for base in self.kv_caches_base_addr[self.engine_id][layer]:
+                    for bid in range(self.num_blocks):
+                        src_blocks.append((base + bid * seg_len, seg_len, self.rank))
+            src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+            self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
-                self._merge_buffers = []
-                for key_t, val_t in self.kv_caches:
-                    nb, bs, hpr, hd = key_t.shape
-                    dst_h = hpr * group_size
-                    kbuf = torch.empty((nb, bs, dst_h, hd), dtype=key_t.dtype, device=key_t.device)
-                    vbuf = torch.empty_like(kbuf)
-                    self._merge_buffers.append((kbuf, vbuf))
-
-                for offset in range(1, group_size):
-                    gather_blocks = []
-                    for kbuf, vbuf in self._merge_buffers:
-                        for base in (kbuf.data_ptr(), vbuf.data_ptr()):
-                            dst_base = base + offset * seg_len
-                            for bid in range(self.num_blocks):
-                                gather_blocks.append((dst_base + bid * seg_len, seg_len, self.rank))
-                    gather_desc = self.nixl_wrapper.get_xfer_descs(gather_blocks, "VRAM")
-                    gather_dlist = self.nixl_wrapper.prep_xfer_dlist("", gather_desc)
-                    src_rank = self.rank + offset
-                    src_handle = self.prefill_dst_xfer_side_handles[engine_id][src_rank]
-                    ids = list(range(len(gather_blocks)))
-                    h = self.nixl_wrapper.make_prepped_xfer("READ", gather_dlist, ids, src_handle, ids, "")
-                    self.nixl_wrapper.transfer(h)
-                    while self.nixl_wrapper.check_xfer_state(h) != "DONE":
-                        time.sleep(1e-3)
-
-                for (k_src, v_src), (kbuf, vbuf) in zip(self.kv_caches, self._merge_buffers):
-                    hpr = k_src.shape[2]
-                    kbuf[:, :, :hpr, :].copy_(k_src)
-                    vbuf[:, :, :hpr, :].copy_(v_src)
-
-                self.kv_caches_base_addr[engine_id] = [[kbuf.data_ptr(), vbuf.data_ptr()] for kbuf, vbuf in
-                                                       self._merge_buffers]
-
-                full_len = seg_len * group_size
-                d2d_blocks = []
-                for kbuf, vbuf in self._merge_buffers:
-                    for base in (kbuf.data_ptr(), vbuf.data_ptr()):
-                        for bid in range(self.num_blocks):
-                            d2d_blocks.append((base + bid * full_len, full_len, remote_rank))
-                merge_src_desc = self.nixl_wrapper.get_xfer_descs(d2d_blocks, "VRAM")
-                self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", merge_src_desc)
-                decode_desc = self.nixl_wrapper.get_xfer_descs(d2d_blocks, "VRAM")
-                self.dst_xfer_side_handles[engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
-                    agent_names[remote_rank], decode_desc)
-                self.dst_num_blocks[engine_id] = self.num_blocks
-                self._tp_size[engine_id] = self._tp_size[self.engine_id]
-
+            dst_blocks = []
+            for layer in range(self.num_layers):
+                for rbase in self.kv_caches_base_addr[engine_id][remote_rank][layer]:
+                    for bid in range(num_blocks):
+                        dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, remote_rank))
+            dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+            self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
+                agent_names[remote_rank], dst_desc
+            )
+            self.dst_num_blocks[engine_id] = num_blocks
+            self._tp_size[engine_id] = self._tp_size[self.engine_id]
             return agent_names
         assert tp_multiplier > 0, f"Decode TP cannot be smaller than prefill TP, got {self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
 
