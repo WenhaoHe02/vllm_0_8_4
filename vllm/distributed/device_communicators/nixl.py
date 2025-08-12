@@ -260,65 +260,83 @@ class DynamoNixlConnector:
 
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         logger.debug("Reading %d blocks from %s to %s", len(local_block_ids), self.agent_name, dst_engine_id)
-
         assert len(local_block_ids) == len(staging_block_ids) == len(remote_block_ids)
-
         if len(local_block_ids) == 0:
             logger.debug("No blocks to read")
             return
 
         start_time = time.perf_counter()
-
         if self._is_mla:
-            # TODO ptarasiewicz: we skip staging when is_mla is true, we shouldn't assign staging blocks at all
             staging_rearranging_ranges = None
             staging_block_ids = local_block_ids
         else:
             local_ranges = self._get_ranges(local_block_ids)
             staging_ranges = self._get_ranges(staging_block_ids)
+            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
+                                                                                                staging_ranges)
 
-            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
-
+        downscale_info = self._downscale_info.get(dst_engine_id)
         tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+        if downscale_info is not None:
+            eff_tp = 1
+            targets = [0]
+        else:
+            eff_tp = max(1, tp_multiplier)
+            targets = list(range(eff_tp))
+
         remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-        local_xfer_side_handle = self.src_xfer_side_handles[tp_multiplier]
+        local_xfer_side_handle = self.src_xfer_side_handles[eff_tp]
         handles = []
 
         logger.debug("Time to get block descs ids: %s ms", (time.perf_counter() - start_time) * 1000)
         create_xfer_start_time = time.perf_counter()
 
-        for i in range(tp_multiplier):
-            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=i, tp_multiplier=tp_multiplier, staging_ranges=staging_rearranging_ranges)
+        for i in targets:
+            staging_block_descs_ids = self._get_block_descs_ids(
+                self.engine_id, "all", staging_block_ids, i=i, tp_multiplier=eff_tp,
+                staging_ranges=staging_rearranging_ranges
+            )
             assert len(staging_block_descs_ids) == len(remote_block_descs_ids)
             remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
-            handle = self.nixl_wrapper.make_prepped_xfer("READ", local_xfer_side_handle, staging_block_descs_ids, 
-                                                        remote_xfer_side_handle, remote_block_descs_ids, 
-                                                        "")
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ", local_xfer_side_handle, staging_block_descs_ids,
+                remote_xfer_side_handle, remote_block_descs_ids, ""
+            )
+            self.nixl_wrapper.transfer(handle)
             handles.append(handle)
-            status = self.nixl_wrapper.transfer(handle)
 
         logger.debug("Time to create xfer: %s ms", (time.perf_counter() - create_xfer_start_time) * 1000)
-
         transfer_start_time = time.perf_counter()
 
-        for handle in handles:
-            while (status := self.nixl_wrapper.check_xfer_state(handle)) != "DONE":
-                if status == "PROC":
-                    time.sleep(0.001)
+        pending = list(handles)
+        while pending:
+            nxt = []
+            for h in pending:
+                status = self.nixl_wrapper.check_xfer_state(h)
+                if status == "DONE":
+                    continue
+                elif status == "PROC":
+                    nxt.append(h)
                 else:
-                    raise RuntimeError("Read transfer failed with state %s", status)
-            # self.nixl_wrapper.abort_xfer(handle) # TODO ptarasiewicz: why abort is throwing errors?
+                    raise RuntimeError(f"Read transfer failed with state {status}")
+            pending = nxt
+            if pending:
+                time.sleep(0.001)
 
         logger.debug("Time to transfer: %s ms", (time.perf_counter() - transfer_start_time) * 1000)
-
         rearrange_start_time = time.perf_counter()
 
         if not self._is_mla:
             for local_range, staging_range in zip(local_rearranging_ranges, staging_rearranging_ranges):
-                logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s", self.kv_caches[0].shape, local_range, staging_range)
+                logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s",
+                             self.kv_caches[0].shape, local_range, staging_range)
                 for kv_cache in self.kv_caches:
                     for cache in kv_cache:
-                        rearrange_tensors(cache[local_range[0]:local_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier, "read")
+                        rearrange_tensors(
+                            cache[local_range[0]:local_range[1] + 1],
+                            cache[staging_range[0]:staging_range[1] + 1],
+                            eff_tp, "read"
+                        )
 
         logger.debug("Time to rearrange tensors: %s ms", (time.perf_counter() - rearrange_start_time) * 1000)
         logger.debug("Total time for read: %s ms", (time.perf_counter() - start_time) * 1000)
@@ -329,13 +347,10 @@ class DynamoNixlConnector:
 
         remote_block_ids = remote_block_ids[:len(local_block_ids)]
         assert len(staging_block_ids) == len(local_block_ids)
-        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
 
         downscale_info = self._downscale_info.get(dst_engine_id)
-        force_serial = getattr(self.vllm_config.kv_transfer_config, "force_serial_write", False)
-        serial_mode = (downscale_info is not None) or force_serial
-
-        if serial_mode and downscale_info is not None:
+        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+        if downscale_info is not None:
             eff_tp = 1
             targets = [0]
         else:
@@ -349,20 +364,19 @@ class DynamoNixlConnector:
                 self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_msg)
             else:
                 for i in range(tp_multiplier):
-                    self.nixl_wrapper.send_notif(
-                        self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i], notify_msg)
+                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i],
+                                                 notify_msg)
             return
 
         start_time = time.perf_counter()
-
         if self._is_mla:
             staging_rearranging_ranges = None
             staging_block_ids = local_block_ids
         else:
             local_ranges = self._get_ranges(local_block_ids)
             staging_ranges = self._get_ranges(staging_block_ids)
-            local_rearranging_ranges, staging_rearranging_ranges = \
-                self._get_same_length_ranges(local_ranges, staging_ranges)
+            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
+                                                                                                staging_ranges)
             for local_range, staging_range in zip(local_rearranging_ranges, staging_rearranging_ranges):
                 logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s",
                              self.kv_caches[0].shape, local_range, staging_range)
@@ -375,42 +389,11 @@ class DynamoNixlConnector:
                         )
 
         logger.debug("Time to rearrange tensors: %s ms", (time.perf_counter() - start_time) * 1000)
-
         create_xfer_start_time = time.perf_counter()
+
         remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
         local_xfer_side_handle = self.src_xfer_side_handles[eff_tp]
 
-        if serial_mode:
-            for i in targets:
-                staging_block_descs_ids = self._get_block_descs_ids(
-                    self.engine_id, "all", staging_block_ids,
-                    i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
-                )
-                assert len(staging_block_descs_ids) == len(remote_block_descs_ids)
-                remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
-                handle = self.nixl_wrapper.make_prepped_xfer(
-                    "WRITE",
-                    local_xfer_side_handle, staging_block_descs_ids,
-                    remote_xfer_side_handle, remote_block_descs_ids,
-                    notify_msg
-                )
-                self.nixl_wrapper.transfer(handle)
-                while True:
-                    status = self.nixl_wrapper.check_xfer_state(handle)
-                    if status == "DONE":
-                        break
-                    elif status == "PROC":
-                        time.sleep(0.001)
-                        continue
-                    else:
-                        raise RuntimeError(f"Write transfer failed with state {status}")
-
-            logger.debug("Time to create & finish all xfers: %s ms",
-                         (time.perf_counter() - create_xfer_start_time) * 1000)
-            logger.debug("Total time for write: %s ms", (time.perf_counter() - start_time) * 1000)
-            return
-
-        logger.debug("Creating xfer handles")
         for i in targets:
             staging_block_descs_ids = self._get_block_descs_ids(
                 self.engine_id, "all", staging_block_ids,
