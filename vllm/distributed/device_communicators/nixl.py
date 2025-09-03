@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import torch
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 import msgspec
@@ -33,15 +33,16 @@ except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
 
+
 class NixlMetadata(
         msgspec.Struct,
         omit_defaults=True,  # type: ignore[call-arg]
-        # required for @cached_property.
         dict=True):
     engine_id: str
     agent_metadata: List[bytes]
-    kv_caches_base_addr: List[List[List[int]]] # base address for each rank for each layer for keys and values
+    kv_caches_base_addr: List[List[List[int]]]  # base address for each rank for each layer for keys and values
     num_blocks: int
+    kv_caches_dev_ids: Optional[List[List[List[int]]]] = None
 
 
 class DynamoNixlConnector:
@@ -73,8 +74,9 @@ class DynamoNixlConnector:
         self.dst_xfer_side_handles = defaultdict(dict)
         self.dst_num_blocks = {}
 
-        self._transfers = defaultdict(list)
+        self.kv_caches_dev_ids = {}
 
+        self._transfers = defaultdict(list)
 
         self._tp_size[engine_id] = vllm_config.parallel_config.tensor_parallel_size
         self._is_mla = "deepseek" in vllm_config.model_config.architectures[0].lower()
@@ -82,6 +84,7 @@ class DynamoNixlConnector:
         self.block_size = None
         self.head_dim = None
 
+        # used only when prefill TP > decode TP
         self._downscale_info = {}
 
     @property
@@ -111,7 +114,7 @@ class DynamoNixlConnector:
                 base_addr = kv_cache.data_ptr()
                 region_len = self.num_cache_entries * num_blocks * self.block_len
                 caches_data.append((base_addr, region_len, self.rank, ""))
-                kv_caches_base_addr.append([base_addr,])
+                kv_caches_base_addr.append([base_addr, ])
 
             self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
 
@@ -147,7 +150,7 @@ class DynamoNixlConnector:
 
     def get_agent_metadata(self):
         return self.nixl_wrapper.get_agent_metadata()
-    
+
     def shutdown(self):
         for descs_list in self._registered_descs:
             self.nixl_wrapper.deregister_memory(descs_list)
@@ -164,28 +167,21 @@ class DynamoNixlConnector:
                 self.nixl_wrapper.release_dlist_handle(prefill_dst_xfer_side_handle)
 
     def _get_ranges(self, block_ids):
-        # This function should return a list of ranges of block ids that are contiguous
-        # For example, if block_ids is [0, 1, 2, 4, 5, 6], the function should return [[0, 2], [4, 6]]
-        # The ranges are sorted by the starting block id
-        # The function should also make sure that the block ids are contiguous
-        # If the block ids are not contiguous, the function should raise an error
         ranges = []
         for i in range(len(block_ids)):
-            if i == 0 or block_ids[i] != block_ids[i-1] + 1:
+            if i == 0 or block_ids[i] != block_ids[i - 1] + 1:
                 ranges.append([block_ids[i], block_ids[i]])
             else:
                 ranges[-1][1] = block_ids[i]
         return ranges
 
     def _get_block_descs_ids(self, engine_id, layer_ids, block_ids, i=None, tp_multiplier=1, staging_ranges=None):
-
         if layer_ids == "all":
             layer_ids = list(range(self.num_layers))
         if block_ids == "all":
             block_ids = list(range(self.num_blocks))
 
         descs_ids = []
-
 
         if i is not None:
             num_blocks = self.num_blocks
@@ -198,36 +194,41 @@ class DynamoNixlConnector:
                                 staging_range_idx += 1
                             start_offset = staging_ranges[staging_range_idx][0]
                             i_offset = i * (staging_ranges[staging_range_idx][-1] - start_offset + 1)
-                            descs_ids.append(layer_id * self.num_cache_entries * num_blocks * tp_multiplier + entry_index * num_blocks * tp_multiplier + start_offset * tp_multiplier + i_offset + (block_id - start_offset))
+                            descs_ids.append(
+                                layer_id * self.num_cache_entries * num_blocks * tp_multiplier
+                                + entry_index * num_blocks * tp_multiplier
+                                + start_offset * tp_multiplier
+                                + i_offset + (block_id - start_offset)
+                            )
                         else:
-                            descs_ids.append(layer_id * self.num_cache_entries * num_blocks + entry_index * num_blocks + block_id)
+                            descs_ids.append(
+                                layer_id * self.num_cache_entries * num_blocks
+                                + entry_index * num_blocks + block_id
+                            )
         else:
             num_blocks = self.dst_num_blocks[engine_id]
             for layer_id in layer_ids:
                 for entry_index in range(self.num_cache_entries):
                     for block_id in block_ids:
-                        descs_ids.append(layer_id * self.num_cache_entries * num_blocks + entry_index * num_blocks + block_id)
+                        descs_ids.append(
+                            layer_id * self.num_cache_entries * num_blocks
+                            + entry_index * num_blocks + block_id
+                        )
         return descs_ids
 
     def _get_same_length_ranges(self, src_ranges, dst_ranges, return_original_src_ranges=False):
-        # This function should return a list of ranges for both src and dst so that corresponding ranges are the same length
-        # For example, if src_ranges is [[0, 2] [4, 8]] and dst_ranges is [[1, 3], [5, 7], [9, 10]]
-        # The function should return ([[0, 2], [4, 6], [7, 8]], [[1, 3], [5, 7], [9, 10]])
         src_overlapping_ranges, dst_overlapping_ranges = [], []
-
         original_src_ranges = []
         org_src_range = tuple(src_ranges[0])
-        
+
         src_idx, dst_idx = 0, 0
         while src_idx < len(src_ranges) and dst_idx < len(dst_ranges):
             src_range = src_ranges[src_idx]
             dst_range = dst_ranges[dst_idx]
-            
-            # Calculate the length of each range
+
             src_len = src_range[-1] - src_range[0] + 1
             dst_len = dst_range[-1] - dst_range[0] + 1
-            
-            # If ranges have the same length, add them directly
+
             if src_len == dst_len:
                 src_overlapping_ranges.append([src_range[0], src_range[-1]])
                 dst_overlapping_ranges.append([dst_range[0], dst_range[-1]])
@@ -236,20 +237,16 @@ class DynamoNixlConnector:
                 dst_idx += 1
                 if src_idx < len(src_ranges):
                     org_src_range = tuple(src_ranges[src_idx])
-            # If source range is longer, split it
             elif src_len > dst_len:
                 src_overlapping_ranges.append([src_range[0], src_range[0] + dst_len - 1])
                 dst_overlapping_ranges.append([dst_range[0], dst_range[-1]])
                 original_src_ranges.append(org_src_range)
-                # Update source range for next iteration
                 src_ranges[src_idx] = [src_range[0] + dst_len, src_range[-1]]
                 dst_idx += 1
-            # If destination range is longer, split it
-            else:  # src_len < dst_len
+            else:
                 src_overlapping_ranges.append([src_range[0], src_range[-1]])
                 dst_overlapping_ranges.append([dst_range[0], dst_range[0] + src_len - 1])
                 original_src_ranges.append(org_src_range)
-                # Update destination range for next iteration
                 dst_ranges[dst_idx] = [dst_range[0] + src_len, dst_range[-1]]
                 src_idx += 1
                 if src_idx < len(src_ranges):
@@ -257,6 +254,7 @@ class DynamoNixlConnector:
         if return_original_src_ranges:
             return src_overlapping_ranges, dst_overlapping_ranges, original_src_ranges
         return src_overlapping_ranges, dst_overlapping_ranges
+
 
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         logger.debug("Reading %d blocks from %s to %s", len(local_block_ids), self.agent_name, dst_engine_id)
@@ -272,8 +270,7 @@ class DynamoNixlConnector:
         else:
             local_ranges = self._get_ranges(local_block_ids)
             staging_ranges = self._get_ranges(staging_block_ids)
-            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
-                                                                                                staging_ranges)
+            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
 
         downscale_info = self._downscale_info.get(dst_engine_id)
         tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
@@ -299,8 +296,10 @@ class DynamoNixlConnector:
             assert len(staging_block_descs_ids) == len(remote_block_descs_ids)
             remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
             handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ", local_xfer_side_handle, staging_block_descs_ids,
-                remote_xfer_side_handle, remote_block_descs_ids, ""
+                "READ",
+                local_xfer_side_handle, staging_block_descs_ids,
+                remote_xfer_side_handle, remote_block_descs_ids,
+                b""
             )
             self.nixl_wrapper.transfer(handle)
             handles.append(handle)
@@ -357,15 +356,19 @@ class DynamoNixlConnector:
             eff_tp = max(1, tp_multiplier)
             targets = list(range(eff_tp))
 
+        notify_bytes = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
+
         if len(local_block_ids) == 0:
             logger.debug("No blocks to write")
             if downscale_info is not None:
                 rr = downscale_info["remote_rank"]
-                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_msg)
+                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_bytes)
             else:
                 for i in range(tp_multiplier):
-                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i],
-                                                 notify_msg)
+                    self.nixl_wrapper.send_notif(
+                        self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i],
+                        notify_bytes
+                    )
             return
 
         start_time = time.perf_counter()
@@ -375,8 +378,7 @@ class DynamoNixlConnector:
         else:
             local_ranges = self._get_ranges(local_block_ids)
             staging_ranges = self._get_ranges(staging_block_ids)
-            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
-                                                                                                staging_ranges)
+            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
             for local_range, staging_range in zip(local_rearranging_ranges, staging_rearranging_ranges):
                 logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s",
                              self.kv_caches[0].shape, local_range, staging_range)
@@ -405,9 +407,9 @@ class DynamoNixlConnector:
                 "WRITE",
                 local_xfer_side_handle, staging_block_descs_ids,
                 remote_xfer_side_handle, remote_block_descs_ids,
-                notify_msg
+                notify_bytes
             )
-            self._transfers[notify_msg].append(handle)
+            self._transfers[notify_bytes].append(handle)
             self.nixl_wrapper.transfer(handle)
 
         logger.debug("Time to create xfer: %s ms", (time.perf_counter() - create_xfer_start_time) * 1000)
@@ -415,11 +417,19 @@ class DynamoNixlConnector:
 
     def get_notifs(self):
         return self.nixl_wrapper.update_notifs()
-    
+
     def get_new_notifs(self):
         return self.nixl_wrapper.get_new_notifs()
 
-    def add_remote_agent(self, engine_id, agent_metadata, agent_tp, kv_caches_base_addr, num_blocks):
+    def add_remote_agent(
+        self,
+        engine_id,
+        agent_metadata,
+        agent_tp,
+        kv_caches_base_addr,
+        num_blocks,
+        kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
+    ):
         self._tp_size[engine_id] = agent_tp
 
         agent_names = []
@@ -428,7 +438,13 @@ class DynamoNixlConnector:
             agent_names.append(agent_name)
         self._remote_agents[engine_id] = agent_names
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
+        if kv_caches_dev_ids is not None:
+            self.kv_caches_dev_ids[engine_id] = kv_caches_dev_ids
+        else:
+            self.kv_caches_dev_ids[engine_id] = None
+
         tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
+
         if tp_multiplier == 0 and not self._is_mla:
             group_size = self._tp_size[self.engine_id] // self._tp_size[engine_id]
             remote_rank = self.rank // group_size
@@ -436,27 +452,50 @@ class DynamoNixlConnector:
             full_len = seg_len * group_size
             peer_offset = (self.rank % group_size) * seg_len
             self._downscale_info[engine_id] = {"group_size": group_size, "remote_rank": remote_rank}
+
+            local_dev_id = int(torch.cuda.current_device())
+
             src_blocks = []
             for layer in range(self.num_layers):
                 for base in self.kv_caches_base_addr[self.engine_id][layer]:
                     for bid in range(self.num_blocks):
-                        src_blocks.append((base + bid * seg_len, seg_len, self.rank))
+                        src_blocks.append((base + bid * seg_len, seg_len, local_dev_id))
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
             dst_blocks = []
+            remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                for rbase in self.kv_caches_base_addr[engine_id][remote_rank][layer]:
+                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                layer_dev_ids = None
+                if remote_dev_table is not None:
+                    layer_dev_ids = remote_dev_table[remote_rank][layer]  # List[int], 与 bases 对齐
+                for entry_idx, rbase in enumerate(layer_bases):
+                    rdev = (layer_dev_ids[entry_idx]
+                            if layer_dev_ids is not None else int(remote_rank))
                     for bid in range(num_blocks):
-                        dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, remote_rank))
+                        dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, rdev))
+
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
                 agent_names[remote_rank], dst_desc
             )
+
+            try:
+                self.nixl_wrapper.make_connection(agent_names[remote_rank])
+            except Exception as e:
+                logger.debug("make_connection(%s) failed (lazy connect will be used): %s",
+                             agent_names[remote_rank], e)
+
             self.dst_num_blocks[engine_id] = num_blocks
             self._tp_size[engine_id] = self._tp_size[self.engine_id]
             return agent_names
-        assert tp_multiplier > 0, f"Decode TP cannot be smaller than prefill TP, got {self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
+
+
+        assert tp_multiplier > 0, (
+            f"Decode TP cannot be smaller than prefill TP, got "
+            f"{self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
+        )
 
         logger.debug("Creating src xfer side handles for engine %s, tp_multiplier: %s", engine_id, tp_multiplier)
         if self._is_mla:
@@ -464,16 +503,16 @@ class DynamoNixlConnector:
         else:
             dst_block_len = self.block_len // tp_multiplier
         if tp_multiplier not in self.src_xfer_side_handles:
-            # create descs and xfer side handles
             blocks_data = []
             for layer_id in range(self.num_layers):
                 for base_addr in self.kv_caches_base_addr[self.engine_id][layer_id]:
                     for block_id in range(self.num_blocks):
-                            block_offset = block_id * self.block_len
-                            for i in range(1 if self._is_mla else tp_multiplier):
-                                tp_multiplier_offset = i * dst_block_len
-                                blocks_data.append((base_addr + block_offset + tp_multiplier_offset, dst_block_len, self.rank))
-            logger.debug("Created %s blocks for src engine %s and rank %s", len(blocks_data), self.engine_id, self.rank * tp_multiplier + i)
+                        block_offset = block_id * self.block_len
+                        for i in range(1 if self._is_mla else tp_multiplier):
+                            tp_multiplier_offset = i * dst_block_len
+                            blocks_data.append((base_addr + block_offset + tp_multiplier_offset, dst_block_len, self.rank))
+            logger.debug("Created %s blocks for src engine %s (tp_multiplier=%s, local_rank=%s)",
+                         len(blocks_data), self.engine_id, tp_multiplier, self.rank)
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
             self.src_xfer_side_handles[tp_multiplier] = self.nixl_wrapper.prep_xfer_dlist("", descs)
 
@@ -486,9 +525,12 @@ class DynamoNixlConnector:
                     for block_id in range(num_blocks):
                         block_offset = block_id * dst_block_len
                         blocks_data.append((base_addr + block_offset, dst_block_len, self.rank * tp_multiplier + i))
-            logger.debug("Created %s blocks for dst engine %s and rank %s", len(blocks_data), engine_id, self.rank * tp_multiplier + i)
+            logger.debug("Created %s blocks for dst engine %s and rank %s",
+                         len(blocks_data), engine_id, self.rank * tp_multiplier + i)
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
-            self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[engine_id][self.rank * tp_multiplier + i], descs)
+            self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(
+                self._remote_agents[engine_id][self.rank * tp_multiplier + i], descs
+            )
 
         return agent_names
 
@@ -499,12 +541,11 @@ class DynamoNixlConnector:
             for handle in handles:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
-                    # self.nixl_wrapper.release_xfer_handle(handle) # TODO ptarasiewicz: why abort is throwing errors?
                     continue
                 if xfer_state == "PROC":
                     running_reqs.append(handle)
                 else:
-                    raise RuntimeError("Transfer failed with state %s", xfer_state)
+                    raise RuntimeError(f"Transfer failed with state {xfer_state}")
             if len(running_reqs) == 0:
                 done_req_ids.append(req_id)
             else:
