@@ -418,10 +418,17 @@ class DynamoNixlConnector:
                         )
             logger.info("[WRITE] rearrange_ms=%.3f", (time.perf_counter() - t_re) * 1000)
 
-        # 构造 desc 并发起传输
         remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
         local_handle = self.src_xfer_side_handles[eff_tp]
+
         created, handles = 0, []
+
+        def _to_notify_str(x):
+            return x if isinstance(x, str) else str(x)
+
+        # down 场景：写阶段不携带 notify（空字符串）；up/equal：携带真正的 notify
+        notify_payload_str = "" if (down is not None) else _to_notify_str(notify_msg)
+
         for i in targets:
             staging_desc_ids = self._get_block_descs_ids(
                 self.engine_id, "all", staging_block_ids,
@@ -431,20 +438,20 @@ class DynamoNixlConnector:
                 f"[WRITE] desc len mismatch: staging={len(staging_desc_ids)} remote={len(remote_desc_ids)}"
             remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
-            # 下采样：写阶段一律不携带 notify（防止半块唤醒）
-            nbytes = "" if (down is not None) else notify_bytes
-
             h = self.nixl_wrapper.make_prepped_xfer(
                 "WRITE",
                 local_handle, staging_desc_ids,
                 remote_handle, remote_desc_ids,
-                nbytes
+                notify_payload_str  # ← 关键：xfer 中的 notify 用 str，down 时为空字符串
             )
-            notify_key = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-            self._transfers[notify_key].append(h)
+            # 只有“携带了非空 notify”的 xfer 才放入 _transfers，用于上层 done 跟踪
+            if notify_payload_str:
+                self._transfers.setdefault(notify_payload_str, []).append(h)
+
             self.nixl_wrapper.transfer(h)
             handles.append(h)
             created += 1
+
         logger.info("[WRITE] xfers=%s", created)
 
         # ==== 下采样强同步：等待本 rank 全部写完 + 组内 barrier + 单点通知 ====
@@ -485,8 +492,10 @@ class DynamoNixlConnector:
                 logger.info("[WRITE] tp_barrier skipped")
 
             # 3) 仅由 leader 发最终通知
+            # ... 等待 DMA 完成 + barrier 之后：
             if leader:
-                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_bytes)
+                final_notify = _to_notify_str(notify_msg)
+                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], final_notify)
                 logger.info("[WRITE] final notify -> remote_rank=%s (leader)", rr)
             else:
                 logger.info("[WRITE] follower: no final notify")
