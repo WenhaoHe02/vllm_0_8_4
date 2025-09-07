@@ -17,6 +17,7 @@ import torch
 from typing import List, Tuple, Optional
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+import os
 import msgspec
 import time
 import uuid
@@ -535,15 +536,23 @@ class DynamoNixlConnector:
 
         if tp_multiplier == 0 and not self._is_mla:
             group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
-            assert group_size >= 1, f"[ADD] invalid group_size={group_size}"
             remote_rank = self.rank // group_size
             seg_len = self.block_len
             full_len = seg_len * group_size
-            peer_offset = (self.rank % group_size) * seg_len
+            peer_idx = self.rank % group_size
+            peer_offset = peer_idx * seg_len
+            notify_leader = (peer_idx == group_size - 1)
 
-            self._downscale_info[engine_id] = {"group_size": group_size, "remote_rank": remote_rank}
-            logger.info("[ADD] downscale on: group_size=%s remote_rank=%s seg_len=%s full_len=%s peer_offset=%s",
-                        group_size, remote_rank, seg_len, full_len, peer_offset)
+            self._downscale_info[engine_id] = {
+                "group_size": group_size,
+                "remote_rank": remote_rank,
+                "peer_idx": peer_idx,
+                "notify_leader": notify_leader,
+            }
+
+            logger.info(
+                "[ADD] downscale on: group_size=%s remote_rank=%s peer_idx=%s leader=%s seg_len=%s full_len=%s peer_offset=%s",
+                group_size, remote_rank, peer_idx, notify_leader, seg_len, full_len, peer_offset)
 
             # SRC（本地）dlist：key=1
             local_dev_id = int(torch.cuda.current_device())
