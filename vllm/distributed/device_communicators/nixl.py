@@ -437,22 +437,24 @@ class DynamoNixlConnector:
         self._remote_agents[engine_id] = agent_names
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
         self.kv_caches_dev_ids[engine_id] = kv_caches_dev_ids if kv_caches_dev_ids is not None else None
+        loc_base = self.kv_caches_base_addr[engine_id]
+        loc_dev = self.kv_caches_dev_ids[engine_id]
         assert isinstance(agent_tp, int) and agent_tp > 0
         assert len(agent_metadata) == agent_tp
-        assert len(kv_caches_base_addr) == agent_tp
+        assert len(loc_base) == agent_tp
         for r in range(agent_tp):
-            assert len(kv_caches_base_addr[r]) == self.num_layers
+            assert len(loc_base[r]) == self.num_layers
             for layer in range(self.num_layers):
-                assert len(kv_caches_base_addr[r][layer]) == self.num_cache_entries
+                assert len(loc_base[r][layer]) == self.num_cache_entries
         tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
         if tp_multiplier == 0 and not self._is_mla:
-            if kv_caches_dev_ids is None:
+            if loc_dev is None:
                 raise RuntimeError("[downscale] kv_caches_dev_ids is required when decode TP < prefill TP.")
-            assert len(kv_caches_dev_ids) == agent_tp
+            assert len(loc_dev) == agent_tp
             for r in range(agent_tp):
-                assert len(kv_caches_dev_ids[r]) == self.num_layers
+                assert len(loc_dev[r]) == self.num_layers
                 for layer in range(self.num_layers):
-                    assert len(kv_caches_dev_ids[r][layer]) == self.num_cache_entries
+                    assert len(loc_dev[r][layer]) == self.num_cache_entries
             group_size = self._tp_size[self.engine_id] // self._tp_size[engine_id]
             assert group_size >= 1
             remote_rank = self.rank // group_size
@@ -470,8 +472,8 @@ class DynamoNixlConnector:
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
             dst_blocks = []
             for layer in range(self.num_layers):
-                layer_bases = kv_caches_base_addr[engine_id][remote_rank][layer]
-                layer_devids = kv_caches_dev_ids[remote_rank][layer]
+                layer_bases = loc_base[remote_rank][layer]
+                layer_devids = loc_dev[remote_rank][layer]
                 for entry_idx, rbase in enumerate(layer_bases):
                     rdev = int(layer_devids[entry_idx])
                     for bid in range(num_blocks):
@@ -508,12 +510,10 @@ class DynamoNixlConnector:
             blocks_data = []
             remote_rank = self.rank * tp_multiplier + i
             for layer_id in range(self.num_layers):
-                layer_bases = kv_caches_base_addr[engine_id][remote_rank][layer_id]
-                layer_devids = (kv_caches_dev_ids[remote_rank][layer_id]
-                                if kv_caches_dev_ids is not None else None)
+                layer_bases = loc_base[remote_rank][layer_id]
+                layer_devids = (loc_dev[remote_rank][layer_id] if loc_dev is not None else None)
                 for entry_idx, base_addr in enumerate(layer_bases):
-                    rdev = (int(layer_devids[entry_idx])
-                            if layer_devids is not None else int(remote_rank))
+                    rdev = (int(layer_devids[entry_idx]) if layer_devids is not None else int(remote_rank))
                     for block_id in range(num_blocks):
                         block_offset = block_id * dst_block_len
                         blocks_data.append((base_addr + block_offset, dst_block_len, rdev))
