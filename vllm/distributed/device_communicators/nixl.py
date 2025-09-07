@@ -496,29 +496,12 @@ class DynamoNixlConnector:
 
                 # 2) TP barrier
                 try:
-                    import torch.distributed as dist
                     from vllm.distributed import parallel_state as ps
-                    g = ps.get_tensor_model_parallel_group()  # 可能是 GroupCoordinator
-                    pg = self._resolve_pg(g)
-                    tp_rank = ps.get_tensor_model_parallel_rank()
-                    if pg is None:
-                        logger.warning("[WRITE] barrier skip: cannot resolve ProcessGroup from %s", type(g).__name__)
-                    elif not dist.is_initialized():
-                        logger.warning("[WRITE] barrier skip: dist not initialized")
-                    else:
-                        try:
-                            ws = dist.get_world_size(pg)
-                        except Exception:
-                            ws = -1
-                        if ws and ws > 1:
-                            logger.info("[WRITE] barrier_enter tp_rank=%s ws=%s", tp_rank, ws)
-                            dist.barrier(group=pg)
-                            logger.info("[WRITE] barrier_exit  tp_rank=%s ws=%s", tp_rank, ws)
-                        else:
-                            logger.info("[WRITE] barrier skip: ws=%s", ws)
-                except Exception as e:
-                    logger.warning("[WRITE] barrier soft-fail: %s", e)
-                    # 不抛异常，继续往下走；最终由 leader 的 send_notif 来保证 decode 不会提前开始
+                    g = ps.get_tensor_model_parallel_group()
+                    logger.warning("[WRITE] DOWN: skip barrier (group=%s)",
+                                   type(g).__name__ if g is not None else "None")
+                except Exception as _e:
+                    logger.warning("[WRITE] DOWN: skip barrier (inspect group failed: %s)", _e)
 
                 # 3) leader 最终通知（显式）
                 if down["notify_leader"]:
