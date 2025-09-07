@@ -355,150 +355,191 @@ class DynamoNixlConnector:
                     (time.perf_counter() - start_time) * 1000.0)
 
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        logger.info("[WRITE] local=%s staging=%s remote=%s dst=%s notify=%s",
-                    len(local_block_ids), len(staging_block_ids), len(remote_block_ids), dst_engine_id,
-                    type(notify_msg).__name__)
-        remote_block_ids = remote_block_ids[:len(local_block_ids)]
-        assert len(staging_block_ids) == len(local_block_ids), \
-            f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
+        try:
+            logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
+                        dst_engine_id, len(local_block_ids), len(staging_block_ids),
+                        len(remote_block_ids), type(notify_msg).__name__)
 
-        down = self._downscale_info.get(dst_engine_id)
-        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+            # —— 参数准备 ——
+            remote_block_ids = remote_block_ids[:len(local_block_ids)]
+            assert len(staging_block_ids) == len(local_block_ids), \
+                f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
 
-        if down is not None:
-            eff_tp, targets = 1, [0]
-            rr = down["remote_rank"]
-            leader = bool(down.get("notify_leader", False))
-            logger.info("[WRITE] downscale: remote_rank=%s group_size=%s peer_idx=%s leader=%s",
-                        rr, down.get("group_size"), down.get("peer_idx"), leader)
-            staging_rearranging_ranges = None
-            staging_block_ids = local_block_ids
-            do_rearrange = False
-        else:
-            eff_tp = max(1, tp_multiplier)
-            targets = list(range(eff_tp))
-            if self._is_mla:
+            down = self._downscale_info.get(dst_engine_id)
+            tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+
+            # 统一把“将写入 xfer 里的 notify”作为 str 处理；down 时为空串
+            def _to_notify_str(x):
+                return x if isinstance(x, str) else str(x)
+
+            notify_payload_str = "" if (down is not None) else _to_notify_str(notify_msg)
+
+            # —— 选择路径 / 是否需要重排 ——
+            if down is not None:
+                rr = down["remote_rank"]
+                group_size = down.get("group_size") or (
+                            self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id]))
+                peer_idx = down.get("peer_idx")
+                leader = down.get("notify_leader")
+                if peer_idx is None or leader is None:
+                    peer_idx = self.rank % group_size
+                    leader = (peer_idx == group_size - 1)
+                    down["peer_idx"] = peer_idx
+                    down["notify_leader"] = leader
+                logger.info("[WRITE] path=DOWN remote_rank=%s group_size=%s peer_idx=%s leader=%s tp_mult=%s",
+                            rr, group_size, peer_idx, leader, tp_multiplier)
+                eff_tp, targets = 1, [0]
                 staging_rearranging_ranges = None
                 staging_block_ids = local_block_ids
                 do_rearrange = False
             else:
-                local_ranges = self._get_ranges(local_block_ids)
-                staging_ranges = self._get_ranges(staging_block_ids)
-                local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
-                                                                                                    staging_ranges)
-                do_rearrange = True
-            logger.info("[WRITE] tp_multiplier=%s eff_tp=%s targets=%s", tp_multiplier, eff_tp, targets)
-
-        notify_bytes = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
-
-        if not local_block_ids:
-            logger.info("[WRITE] no-op (0 blocks)")
-            if down is None:
-                for i in range(tp_multiplier):
-                    trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
-                    self.nixl_wrapper.send_notif(trg, notify_bytes)
-                logger.info("[WRITE] notify broadcast tp=%s", tp_multiplier)
-            else:
-                if leader:
-                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], notify_bytes)
-                    logger.info("[WRITE] notify -> remote_rank=%s (leader, no-op)", rr)
+                eff_tp = max(1, tp_multiplier)
+                targets = list(range(eff_tp))
+                if self._is_mla:
+                    staging_rearranging_ranges = None
+                    staging_block_ids = local_block_ids
+                    do_rearrange = False
                 else:
-                    logger.info("[WRITE] follower no-op: skip notify")
-            return
+                    local_ranges = self._get_ranges(local_block_ids)
+                    staging_ranges = self._get_ranges(staging_block_ids)
+                    local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
+                                                                                                        staging_ranges)
+                    do_rearrange = True
+                logger.info("[WRITE] path=UP/EQ tp_mult=%s eff_tp=%s targets=%s", tp_multiplier, eff_tp, targets)
 
-        if do_rearrange:
-            t_re = time.perf_counter()
-            for l_rng, s_rng in zip(local_rearranging_ranges, staging_rearranging_ranges):
-                for kv_cache in self.kv_caches:
-                    for cache in kv_cache:
-                        rearrange_tensors(
-                            cache[l_rng[0]: l_rng[1] + 1],
-                            cache[s_rng[0]: s_rng[1] + 1],
-                            eff_tp, "write"
-                        )
-            logger.info("[WRITE] rearrange_ms=%.3f", (time.perf_counter() - t_re) * 1000)
-
-        remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-        local_handle = self.src_xfer_side_handles[eff_tp]
-
-        created, handles = 0, []
-
-        def _to_notify_str(x):
-            return x if isinstance(x, str) else str(x)
-
-        # down 场景：写阶段不携带 notify（空字符串）；up/equal：携带真正的 notify
-        notify_payload_str = "" if (down is not None) else _to_notify_str(notify_msg)
-
-        for i in targets:
-            staging_desc_ids = self._get_block_descs_ids(
-                self.engine_id, "all", staging_block_ids,
-                i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
-            )
-            assert len(staging_desc_ids) == len(remote_desc_ids), \
-                f"[WRITE] desc len mismatch: staging={len(staging_desc_ids)} remote={len(remote_desc_ids)}"
-            remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
-
-            h = self.nixl_wrapper.make_prepped_xfer(
-                "WRITE",
-                local_handle, staging_desc_ids,
-                remote_handle, remote_desc_ids,
-                notify_payload_str  # ← 关键：xfer 中的 notify 用 str，down 时为空字符串
-            )
-            # 只有“携带了非空 notify”的 xfer 才放入 _transfers，用于上层 done 跟踪
-            if notify_payload_str:
-                self._transfers.setdefault(notify_payload_str, []).append(h)
-
-            self.nixl_wrapper.transfer(h)
-            handles.append(h)
-            created += 1
-
-        logger.info("[WRITE] xfers=%s", created)
-
-        # ==== 下采样强同步：等待本 rank 全部写完 + 组内 barrier + 单点通知 ====
-        if down is not None:
-            # 1) 等待本 rank 所有写完成
-            t_wait = time.perf_counter()
-            pending = list(handles)
-            while pending:
-                nxt = []
-                for h in pending:
-                    st = self.nixl_wrapper.check_xfer_state(h)
-                    if st == "DONE":
-                        continue
-                    if st == "PROC":
-                        nxt.append(h)
+            # —— 0 块：只 notify（down 只有 leader 发） ——
+            if not local_block_ids:
+                logger.info("[WRITE] zero-block case")
+                if down is None:
+                    for i in range(tp_multiplier):
+                        trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
+                        self.nixl_wrapper.send_notif(trg, _to_notify_str(notify_msg))
+                    logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
+                else:
+                    if down["notify_leader"]:
+                        trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
+                        self.nixl_wrapper.send_notif(trg, _to_notify_str(notify_msg))
+                        logger.info("[WRITE] zero-block leader notify -> remote_rank=%s", down["remote_rank"])
                     else:
-                        logger.error("[WRITE] transfer failed: %s", st)
-                        raise RuntimeError(f"[WRITE] transfer failed with state {st}")
-                pending = nxt
-                if pending:
-                    time.sleep(0.001)
-            logger.info("[WRITE] local_xfer_wait_ms=%.3f", (time.perf_counter() - t_wait) * 1000)
+                        logger.info("[WRITE] zero-block follower skip notify")
+                return
 
-            # 2) TP 组 barrier（只在下采样生效；需要 vLLM 已初始化分布式）
+            # —— 可选重排（仅 UP/EQ） ——
+            if do_rearrange:
+                t0 = time.perf_counter()
+                for l_rng, s_rng in zip(local_rearranging_ranges, staging_rearranging_ranges):
+                    for kv_cache in self.kv_caches:
+                        for cache in kv_cache:
+                            rearrange_tensors(
+                                cache[l_rng[0]: l_rng[1] + 1],
+                                cache[s_rng[0]: s_rng[1] + 1],
+                                eff_tp, "write"
+                            )
+                logger.info("[WRITE] rearrange_ms=%.3f", (time.perf_counter() - t0) * 1000)
+
+            # —— 构造 desc 并发起传输 ——
+            remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
+            local_handle = self.src_xfer_side_handles[eff_tp]
+            logger.info("[WRITE] desc lens: remote=%d local_eff_tp=%d", len(remote_desc_ids), eff_tp)
+
+            created, handles = 0, []
+            for i in targets:
+                staging_desc_ids = self._get_block_descs_ids(
+                    self.engine_id, "all", staging_block_ids,
+                    i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
+                )
+                if len(staging_desc_ids) != len(remote_desc_ids):
+                    logger.error("[WRITE] desc mismatch staging=%d remote=%d (i=%d)", len(staging_desc_ids),
+                                 len(remote_desc_ids), i)
+                    raise RuntimeError("desc length mismatch")
+                remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
+
+                h = self.nixl_wrapper.make_prepped_xfer(
+                    "WRITE",
+                    local_handle, staging_desc_ids,
+                    remote_handle, remote_desc_ids,
+                    notify_payload_str  # down: ""（禁止半块唤醒）
+                )
+
+                # 只有非空的 notify（UP/EQ）才记录到 _transfers，down 一概不入队
+                if notify_payload_str:
+                    self._transfers.setdefault(notify_payload_str, []).append(h)
+
+                self.nixl_wrapper.transfer(h)
+                handles.append(h)
+                created += 1
+
+            logger.info("[WRITE] xfers=%d", created)
+
+            # —— DOWN 强同步：等待 DONE + barrier + 单点通知 ——
+            if down is not None:
+                # 1) 本地全部 DONE
+                t1 = time.perf_counter()
+                pending = list(handles)
+                rounds = 0
+                while pending:
+                    nxt = []
+                    for h in pending:
+                        st = self.nixl_wrapper.check_xfer_state(h)
+                        if st == "DONE":
+                            continue
+                        if st == "PROC":
+                            nxt.append(h)
+                        else:
+                            logger.error("[WRITE] transfer failed state=%s", st)
+                            raise RuntimeError(f"[WRITE] transfer failed with state {st}")
+                    pending = nxt
+                    rounds += 1
+                    if pending:
+                        time.sleep(0.001)
+                logger.info("[WRITE] local_xfer_wait_ms=%.3f rounds=%d", (time.perf_counter() - t1) * 1000, rounds)
+
+                # 2) TP barrier
+                try:
+                    import torch.distributed as dist
+                    from vllm.distributed import parallel_state as ps
+                    tp_group = ps.get_tensor_model_parallel_group()
+                    tp_rank = ps.get_tensor_model_parallel_rank()
+                    if tp_group is not None:
+                        logger.info("[WRITE] barrier_enter tp_rank=%s", tp_rank)
+                        dist.barrier(group=tp_group)
+                        logger.info("[WRITE] barrier_exit tp_rank=%s", tp_rank)
+                    else:
+                        logger.warning("[WRITE] tp_group is None; skip barrier")
+                except Exception as e:
+                    logger.exception("[WRITE] barrier error: %s", e)
+                    raise
+
+                # 3) leader 最终通知（显式）
+                if down["notify_leader"]:
+                    trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
+                    payload = _to_notify_str(notify_msg)
+                    try:
+                        self.nixl_wrapper.send_notif(trg, payload)
+                        logger.info("[WRITE] final notify sent -> remote_rank=%s len=%d", down["remote_rank"],
+                                    len(payload))
+                    except Exception as e:
+                        logger.exception("[WRITE] final notify error: %s", e)
+                        raise
+                else:
+                    logger.info("[WRITE] follower: no final notify")
+
+            logger.info("[WRITE] end ok dst=%s", dst_engine_id)
+
+        except Exception as e:
+            # 关键：把当前状态全量打出来，便于定位
             try:
-                import torch.distributed as dist
-                from vllm.distributed import parallel_state as ps
-                tp_group = ps.get_tensor_model_parallel_group()
-                tp_rank = ps.get_tensor_model_parallel_rank()
-            except Exception as e:
-                tp_group, tp_rank = None, None
-                logger.warning("[WRITE] tp_group unavailable; skip barrier (%s)", e)
-
-            if tp_group is not None and os.getenv("NIXL_DOWN_BARRIER", "1") == "1":
-                dist.barrier(group=tp_group)
-                logger.info("[WRITE] tp_barrier_done: tp_rank=%s", tp_rank)
-            else:
-                logger.info("[WRITE] tp_barrier skipped")
-
-            # 3) 仅由 leader 发最终通知
-            # ... 等待 DMA 完成 + barrier 之后：
-            if leader:
-                final_notify = _to_notify_str(notify_msg)
-                self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][rr], final_notify)
-                logger.info("[WRITE] final notify -> remote_rank=%s (leader)", rr)
-            else:
-                logger.info("[WRITE] follower: no final notify")
+                logger.error(
+                    "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%s "
+                    "local=%s staging=%s remote=%s notify_repr=%r",
+                    dst_engine_id, bool(self._downscale_info.get(dst_engine_id)),
+                    self._tp_size.get(self.engine_id), self._tp_size.get(dst_engine_id),
+                    (self._tp_size.get(dst_engine_id, 0) // max(1, self._tp_size.get(self.engine_id, 1))),
+                    self.rank, len(local_block_ids), len(staging_block_ids), len(remote_block_ids),
+                    notify_msg
+                )
+            finally:
+                raise
 
     def get_notifs(self):
         return self.nixl_wrapper.update_notifs()
@@ -563,6 +604,11 @@ class DynamoNixlConnector:
             logger.info(
                 "[ADD] downscale on: group_size=%s remote_rank=%s peer_idx=%s leader=%s seg_len=%s full_len=%s peer_offset=%s",
                 group_size, remote_rank, peer_idx, notify_leader, seg_len, full_len, peer_offset)
+
+            logger.info("[ADD] downscale prepared: src_handle_keys=%s dst_handle_keys=%s dst_num_blocks=%s",
+                        list(self.src_xfer_side_handles.keys()),
+                        list(self.dst_xfer_side_handles[engine_id].keys()),
+                        self.dst_num_blocks[engine_id])
 
             # SRC（本地）dlist：key=1
             local_dev_id = int(torch.cuda.current_device())
@@ -648,19 +694,31 @@ class DynamoNixlConnector:
         return agent_names
 
     def get_done_tranfers(self) -> List[str]:
-        done_req_ids = []
-        for req_id, handles in self._transfers.items():
-            running_reqs = []
-            for handle in handles:
-                xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                if xfer_state == "DONE":
+        done_req_ids: List[str] = []
+        for req_id, handles in list(self._transfers.items()):
+            # 健壮性：只接受非空字符串作为合法 key，其它键打印错误并丢弃
+            if not isinstance(req_id, str) or req_id == "":
+                logger.error("[DONE] illegal key (drop): type=%s repr=%r", type(req_id).__name__, req_id)
+                del self._transfers[req_id]
+                continue
+
+            running = []
+            for h in handles:
+                st = self.nixl_wrapper.check_xfer_state(h)
+                if st == "DONE":
                     continue
-                if xfer_state == "PROC":
-                    running_reqs.append(handle)
+                if st == "PROC":
+                    running.append(h)
                 else:
-                    raise RuntimeError(f"Transfer failed with state {xfer_state}")
-            if len(running_reqs) == 0:
+                    logger.error("[DONE] transfer failed state=%s (key=%s)", st, req_id)
+                    raise RuntimeError(f"[DONE] transfer failed with state {st}")
+
+            if not running:
                 done_req_ids.append(req_id)
+                del self._transfers[req_id]
             else:
-                self._transfers[req_id] = running_reqs
+                self._transfers[req_id] = running
+
+        logger.info("[DONE] report: count=%d keys=%s", len(done_req_ids), done_req_ids[:8])
         return done_req_ids
+
