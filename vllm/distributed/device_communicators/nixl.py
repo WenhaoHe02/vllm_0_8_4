@@ -432,7 +432,7 @@ class DynamoNixlConnector:
             remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
             # 下采样：写阶段一律不携带 notify（防止半块唤醒）
-            nbytes = b"" if (down is not None) else notify_bytes
+            nbytes = "" if (down is not None) else notify_bytes
 
             h = self.nixl_wrapper.make_prepped_xfer(
                 "WRITE",
@@ -440,7 +440,8 @@ class DynamoNixlConnector:
                 remote_handle, remote_desc_ids,
                 nbytes
             )
-            self._transfers[notify_bytes].append(h)
+            notify_key = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
+            self._transfers[notify_key].append(h)
             self.nixl_wrapper.transfer(h)
             handles.append(h)
             created += 1
