@@ -299,7 +299,7 @@ class DynamoNixlConnector:
                 "READ",
                 local_xfer_side_handle, staging_block_descs_ids,
                 remote_xfer_side_handle, remote_block_descs_ids,
-                b""
+                ""
             )
             self.nixl_wrapper.transfer(handle)
             handles.append(handle)
@@ -448,20 +448,14 @@ class DynamoNixlConnector:
                 assert len(loc_base[r][layer]) == self.num_cache_entries
         tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
         if tp_multiplier == 0 and not self._is_mla:
-            if loc_dev is None:
-                raise RuntimeError("[downscale] kv_caches_dev_ids is required when decode TP < prefill TP.")
-            assert len(loc_dev) == agent_tp
-            for r in range(agent_tp):
-                assert len(loc_dev[r]) == self.num_layers
-                for layer in range(self.num_layers):
-                    assert len(loc_dev[r][layer]) == self.num_cache_entries
             group_size = self._tp_size[self.engine_id] // self._tp_size[engine_id]
-            assert group_size >= 1
             remote_rank = self.rank // group_size
             seg_len = self.block_len
             full_len = seg_len * group_size
             peer_offset = (self.rank % group_size) * seg_len
+
             self._downscale_info[engine_id] = {"group_size": group_size, "remote_rank": remote_rank}
+
             local_dev_id = int(torch.cuda.current_device())
             src_blocks = []
             for layer in range(self.num_layers):
@@ -470,23 +464,24 @@ class DynamoNixlConnector:
                         src_blocks.append((base + bid * seg_len, seg_len, local_dev_id))
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
+
             dst_blocks = []
             for layer in range(self.num_layers):
-                layer_bases = loc_base[remote_rank][layer]
-                layer_devids = loc_dev[remote_rank][layer]
+                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
                 for entry_idx, rbase in enumerate(layer_bases):
-                    rdev = int(layer_devids[entry_idx])
+                    rdev = int(remote_rank)  # 与 up 分支同假设：rank == device ordinal
                     for bid in range(num_blocks):
                         dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, rdev))
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
-                agent_names[remote_rank], dst_desc
+                self._remote_agents[engine_id][remote_rank], dst_desc
             )
+
             try:
-                self.nixl_wrapper.make_connection(agent_names[remote_rank])
-            except Exception as e:
-                logger.debug("make_connection(%s) failed (lazy connect will be used): %s",
-                             agent_names[remote_rank], e)
+                self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
+            except Exception:
+                pass
+
             self.dst_num_blocks[engine_id] = num_blocks
             self._tp_size[engine_id] = self._tp_size[self.engine_id]
             return agent_names
