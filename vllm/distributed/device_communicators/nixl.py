@@ -592,8 +592,11 @@ class DynamoNixlConnector:
             full_len = seg_len * group_size
             peer_idx = self.rank % group_size
             peer_offset = peer_idx * seg_len
+
+            # 角色信息（leader 只在组内最后一个）
             notify_leader = (peer_idx == group_size - 1)
 
+            # 先记录 downscale 元信息
             self._downscale_info[engine_id] = {
                 "group_size": group_size,
                 "remote_rank": remote_rank,
@@ -601,51 +604,67 @@ class DynamoNixlConnector:
                 "notify_leader": notify_leader,
             }
 
+            # 立刻把 num_blocks 写进去，避免后面任何代码/日志访问 None
+            self.dst_num_blocks[engine_id] = num_blocks
+
             logger.info(
                 "[ADD] downscale on: group_size=%s remote_rank=%s peer_idx=%s leader=%s seg_len=%s full_len=%s peer_offset=%s",
-                group_size, remote_rank, peer_idx, notify_leader, seg_len, full_len, peer_offset)
+                group_size, remote_rank, peer_idx, notify_leader, seg_len, full_len, peer_offset
+            )
 
-            logger.info("[ADD] downscale prepared: src_handle_keys=%s dst_handle_keys=%s dst_num_blocks=%s",
-                        list(self.src_xfer_side_handles.keys()),
-                        list(self.dst_xfer_side_handles[engine_id].keys()),
-                        self.dst_num_blocks[engine_id])
+            # 保底：确保句柄容器已初始化
+            if 1 not in self.src_xfer_side_handles:
+                self.src_xfer_side_handles[1] = None
+            if engine_id not in self.dst_xfer_side_handles:
+                self.dst_xfer_side_handles[engine_id] = {}
 
-            # SRC（本地）dlist：key=1
+            # 本地（prefill）端 xfer 源描述：每层、每 entry、每 block，长度固定 seg_len
             local_dev_id = int(torch.cuda.current_device())
             src_blocks = []
             for layer in range(self.num_layers):
                 for base in self.kv_caches_base_addr[self.engine_id][layer]:
                     for bid in range(self.num_blocks):
                         src_blocks.append((base + bid * seg_len, seg_len, local_dev_id))
-            logger.debug("[ADD] SRC blocks=%d (key=1)", len(src_blocks))
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
+            # 远端（decode）端 xfer 目标描述：把每个 peer 段写到 [bid*full_len + peer_offset]
             dst_blocks = []
+            remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                layer_bases = loc_base[remote_rank][layer]  # entries: K,V 或 1
+                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                layer_dev_ids = None
+                if remote_dev_table is not None:
+                    layer_dev_ids = remote_dev_table[remote_rank][layer]  # 与 bases 对齐的 dev 列表
+
                 for entry_idx, rbase in enumerate(layer_bases):
-                    rdev = int(remote_rank)
+                    rdev = (layer_dev_ids[entry_idx]
+                            if layer_dev_ids is not None else int(remote_rank))
                     for bid in range(num_blocks):
                         dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, rdev))
-            logger.debug("[ADD] DST blocks=%d (key=0)", len(dst_blocks))
+
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
                 self._remote_agents[engine_id][remote_rank], dst_desc
             )
 
+            # 尝试建立连接（懒连接容错）
             try:
                 self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
             except Exception as e:
-                logger.debug("[ADD] make_connection(%s) lazy: %s", self._remote_agents[engine_id][remote_rank], e)
+                logger.debug("make_connection(%s) failed (lazy connect): %s",
+                             self._remote_agents[engine_id][remote_rank], e)
 
-            self.dst_num_blocks[engine_id] = num_blocks
+            # down 场景为了简化后续 id 计算，把对端 TP 视为与本端相同
             self._tp_size[engine_id] = self._tp_size[self.engine_id]
 
-            logger.info("[ADD] downscale prepared: src_handle_keys=%s dst_handle_keys=%s dst_num_blocks=%s",
-                        list(self.src_xfer_side_handles.keys()),
-                        list(self.dst_xfer_side_handles[engine_id].keys()),
-                        self.dst_num_blocks[engine_id])
+            # 日志：直接打印 num_blocks（不要再读字典，避免 KeyError）
+            logger.info(
+                "[ADD] downscale prepared: src_handle_keys=%s dst_handle_keys=%s dst_num_blocks=%s",
+                list(self.src_xfer_side_handles.keys()),
+                list(self.dst_xfer_side_handles[engine_id].keys()),
+                num_blocks
+            )
             return agent_names
 
         assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
@@ -693,12 +712,14 @@ class DynamoNixlConnector:
                     self.dst_num_blocks[engine_id])
         return agent_names
 
+    _last_done_log_ts = 0.0  # 放在类的 __init__ 里也可
+
     def get_done_tranfers(self) -> List[str]:
         done_req_ids: List[str] = []
         for req_id, handles in list(self._transfers.items()):
-            # 健壮性：只接受非空字符串作为合法 key，其它键打印错误并丢弃
             if not isinstance(req_id, str) or req_id == "":
-                logger.error("[DONE] illegal key (drop): type=%s repr=%r", type(req_id).__name__, req_id)
+                logger.error("[DONE] illegal key (drop): type=%s repr=%r",
+                             type(req_id).__name__, req_id)
                 del self._transfers[req_id]
                 continue
 
@@ -719,6 +740,16 @@ class DynamoNixlConnector:
             else:
                 self._transfers[req_id] = running
 
-        logger.info("[DONE] report: count=%d keys=%s", len(done_req_ids), done_req_ids[:8])
+        # 只有有完成项才打 info；空结果限频/降级
+        if done_req_ids:
+            logger.info("[DONE] report: count=%d keys=%s",
+                        len(done_req_ids), done_req_ids[:8])
+        else:
+            # 可选：限频 1 秒一条；或者直接 logger.debug
+            now = time.time()
+            if now - getattr(self, "_last_done_log_ts", 0.0) > 1.0:
+                logger.debug("[DONE] report: empty")
+                self._last_done_log_ts = now
+
         return done_req_ids
 
