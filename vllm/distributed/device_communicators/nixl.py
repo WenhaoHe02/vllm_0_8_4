@@ -368,6 +368,8 @@ class DynamoNixlConnector:
             down = self._downscale_info.get(dst_engine_id)
             tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
 
+
+
             # 统一把“将写入 xfer 里的 notify”作为 str 处理；down 时为空串
             def _to_notify_str(x):
                 return x if isinstance(x, str) else str(x)
@@ -392,6 +394,18 @@ class DynamoNixlConnector:
                 staging_rearranging_ranges = None
                 staging_block_ids = local_block_ids
                 do_rearrange = False
+
+                # 仅用于映射预览（down 路径 eff_tp=1）
+                staging_block_descs_ids = self._get_block_descs_ids(
+                    self.engine_id, "all", staging_block_ids,
+                    i=0, tp_multiplier=1, staging_ranges=staging_rearranging_ranges,
+                )
+
+                preview_k = min(10, len(staging_block_descs_ids), len(remote_block_descs_ids))
+                sids = staging_block_descs_ids[:preview_k]
+                rids = remote_block_descs_ids[:preview_k]
+                logger.info("[WRITE][TRACE] map sample k=%d (sid->rid): %s",
+                            preview_k, list(zip(sids, rids)))
             else:
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
@@ -458,7 +472,7 @@ class DynamoNixlConnector:
                     "WRITE",
                     local_handle, staging_desc_ids,
                     remote_handle, remote_desc_ids,
-                    notify_payload_str  # down: ""（禁止半块唤醒）
+                    ""  # down: ""（禁止半块唤醒）
                 )
 
                 # 只有非空的 notify（UP/EQ）才记录到 _transfers，down 一概不入队
@@ -640,7 +654,8 @@ class DynamoNixlConnector:
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
                 self._remote_agents[engine_id][remote_rank], dst_desc
             )
-
+            logger.info("[ADD][TRACE] src_blocks[:10]=%s", src_blocks[:10])
+            logger.info("[ADD][TRACE] dst_blocks[:10]=%s", dst_blocks[:10])
             # 尝试建立连接（懒连接容错）
             try:
                 self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
