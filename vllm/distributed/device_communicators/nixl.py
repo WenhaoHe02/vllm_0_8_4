@@ -360,7 +360,6 @@ class DynamoNixlConnector:
                         dst_engine_id, len(local_block_ids), len(staging_block_ids),
                         len(remote_block_ids), type(notify_msg).__name__)
 
-            # —— 参数准备 ——
             remote_block_ids = remote_block_ids[:len(local_block_ids)]
             assert len(staging_block_ids) == len(local_block_ids), \
                 f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
@@ -368,19 +367,17 @@ class DynamoNixlConnector:
             down = self._downscale_info.get(dst_engine_id)
             tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
 
-
-
-            # 统一把“将写入 xfer 里的 notify”作为 str 处理；down 时为空串
             def _to_notify_str(x):
                 return x if isinstance(x, str) else str(x)
 
+            # down 路径：DMA 不带 notify；up/equal：DMA 带 notify
             notify_payload_str = "" if (down is not None) else _to_notify_str(notify_msg)
 
-            # —— 选择路径 / 是否需要重排 ——
             if down is not None:
                 rr = down["remote_rank"]
                 group_size = down.get("group_size") or (
-                            self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id]))
+                        self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
+                )
                 peer_idx = down.get("peer_idx")
                 leader = down.get("notify_leader")
                 if peer_idx is None or leader is None:
@@ -390,22 +387,11 @@ class DynamoNixlConnector:
                     down["notify_leader"] = leader
                 logger.info("[WRITE] path=DOWN remote_rank=%s group_size=%s peer_idx=%s leader=%s tp_mult=%s",
                             rr, group_size, peer_idx, leader, tp_multiplier)
+
                 eff_tp, targets = 1, [0]
                 staging_rearranging_ranges = None
                 staging_block_ids = local_block_ids
                 do_rearrange = False
-
-                # 仅用于映射预览（down 路径 eff_tp=1）
-                staging_block_descs_ids = self._get_block_descs_ids(
-                    self.engine_id, "all", staging_block_ids,
-                    i=0, tp_multiplier=1, staging_ranges=staging_rearranging_ranges,
-                )
-
-                preview_k = min(10, len(staging_block_descs_ids), len(remote_block_descs_ids))
-                sids = staging_block_descs_ids[:preview_k]
-                rids = remote_block_descs_ids[:preview_k]
-                logger.info("[WRITE][TRACE] map sample k=%d (sid->rid): %s",
-                            preview_k, list(zip(sids, rids)))
             else:
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
@@ -416,12 +402,11 @@ class DynamoNixlConnector:
                 else:
                     local_ranges = self._get_ranges(local_block_ids)
                     staging_ranges = self._get_ranges(staging_block_ids)
-                    local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges,
-                                                                                                        staging_ranges)
+                    local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(
+                        local_ranges, staging_ranges)
                     do_rearrange = True
                 logger.info("[WRITE] path=UP/EQ tp_mult=%s eff_tp=%s targets=%s", tp_multiplier, eff_tp, targets)
 
-            # —— 0 块：只 notify（down 只有 leader 发） ——
             if not local_block_ids:
                 logger.info("[WRITE] zero-block case")
                 if down is None:
@@ -438,7 +423,6 @@ class DynamoNixlConnector:
                         logger.info("[WRITE] zero-block follower skip notify")
                 return
 
-            # —— 可选重排（仅 UP/EQ） ——
             if do_rearrange:
                 t0 = time.perf_counter()
                 for l_rng, s_rng in zip(local_rearranging_ranges, staging_rearranging_ranges):
@@ -451,10 +435,20 @@ class DynamoNixlConnector:
                             )
                 logger.info("[WRITE] rearrange_ms=%.3f", (time.perf_counter() - t0) * 1000)
 
-            # —— 构造 desc 并发起传输 ——
+            # —— 先算远端 desc（修正你之前的 NameError/变量名不一致）——
             remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
             local_handle = self.src_xfer_side_handles[eff_tp]
             logger.info("[WRITE] desc lens: remote=%d local_eff_tp=%d", len(remote_desc_ids), eff_tp)
+
+            # ——（可选）映射预览：现在用正确的 remote_desc_ids ——
+            if down is not None:
+                staging_desc_ids_preview = self._get_block_descs_ids(
+                    self.engine_id, "all", staging_block_ids,
+                    i=0, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
+                )
+                k = min(10, len(staging_desc_ids_preview), len(remote_desc_ids))
+                logger.info("[WRITE][TRACE] map sample k=%d (sid->rid): %s",
+                            k, list(zip(staging_desc_ids_preview[:k], remote_desc_ids[:k])))
 
             created, handles = 0, []
             for i in targets:
@@ -463,19 +457,20 @@ class DynamoNixlConnector:
                     i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
                 )
                 if len(staging_desc_ids) != len(remote_desc_ids):
-                    logger.error("[WRITE] desc mismatch staging=%d remote=%d (i=%d)", len(staging_desc_ids),
-                                 len(remote_desc_ids), i)
+                    logger.error("[WRITE] desc mismatch staging=%d remote=%d (i=%d)",
+                                 len(staging_desc_ids), len(remote_desc_ids), i)
                     raise RuntimeError("desc length mismatch")
                 remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
+                # 关键修复：up/equal 用 notify_payload_str，down 用空串（上面已设）
                 h = self.nixl_wrapper.make_prepped_xfer(
                     "WRITE",
                     local_handle, staging_desc_ids,
                     remote_handle, remote_desc_ids,
-                    ""  # down: ""（禁止半块唤醒）
+                    notify_payload_str
                 )
 
-                # 只有非空的 notify（UP/EQ）才记录到 _transfers，down 一概不入队
+                # 只有非空的 notify（UP/EQ）才记录到 _transfers
                 if notify_payload_str:
                     self._transfers.setdefault(notify_payload_str, []).append(h)
 
@@ -485,9 +480,8 @@ class DynamoNixlConnector:
 
             logger.info("[WRITE] xfers=%d", created)
 
-            # —— DOWN 强同步：等待 DONE + barrier + 单点通知 ——
             if down is not None:
-                # 1) 本地全部 DONE
+                # 1) 等所有传输 DONE
                 t1 = time.perf_counter()
                 pending = list(handles)
                 rounds = 0
@@ -508,7 +502,7 @@ class DynamoNixlConnector:
                         time.sleep(0.001)
                 logger.info("[WRITE] local_xfer_wait_ms=%.3f rounds=%d", (time.perf_counter() - t1) * 1000, rounds)
 
-                # 2) TP barrier
+                # 2) 不做 dist.barrier（vLLM 的 GroupCoordinator 不是 ProcessGroup）
                 try:
                     from vllm.distributed import parallel_state as ps
                     g = ps.get_tensor_model_parallel_group()
@@ -517,14 +511,14 @@ class DynamoNixlConnector:
                 except Exception as _e:
                     logger.warning("[WRITE] DOWN: skip barrier (inspect group failed: %s)", _e)
 
-                # 3) leader 最终通知（显式）
+                # 3) 只有 leader 显式发最终 notify
                 if down["notify_leader"]:
                     trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
                     payload = _to_notify_str(notify_msg)
                     try:
                         self.nixl_wrapper.send_notif(trg, payload)
-                        logger.info("[WRITE] final notify sent -> remote_rank=%s len=%d", down["remote_rank"],
-                                    len(payload))
+                        logger.info("[WRITE] final notify sent -> remote_rank=%s len=%d",
+                                    down["remote_rank"], len(payload))
                     except Exception as e:
                         logger.exception("[WRITE] final notify error: %s", e)
                         raise
@@ -534,7 +528,6 @@ class DynamoNixlConnector:
             logger.info("[WRITE] end ok dst=%s", dst_engine_id)
 
         except Exception as e:
-            # 关键：把当前状态全量打出来，便于定位
             try:
                 logger.error(
                     "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%s "
