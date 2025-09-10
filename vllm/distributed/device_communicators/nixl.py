@@ -148,6 +148,11 @@ class DynamoNixlConnector:
             logger.debug("Registering descs: %s", caches_data)
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
+            logger.info(
+                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%s head_dim=%s block_size=%s",
+                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
+                self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
+            )
 
     def get_agent_metadata(self):
         return self.nixl_wrapper.get_agent_metadata()
@@ -542,7 +547,12 @@ class DynamoNixlConnector:
                 raise
 
     def get_notifs(self):
-        return self.nixl_wrapper.update_notifs()
+        notifs = self.nixl_wrapper.update_notifs()
+        if notifs:
+            logger.info("[NOTIF] update_notifs count=%d sample=%s", len(notifs), _peek(notifs, 4))
+        else:
+            logger.debug("[NOTIF] update_notifs empty")
+        return notifs
 
     def get_new_notifs(self):
         return self.nixl_wrapper.get_new_notifs()
@@ -556,6 +566,7 @@ class DynamoNixlConnector:
             num_blocks: int,
             kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
+        logger.info("[ADD] num_blocks=%d dev_ids=%s", num_blocks, "Y" if kv_caches_dev_ids is not None else "N")
         logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
                     engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
