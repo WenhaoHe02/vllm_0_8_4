@@ -88,6 +88,18 @@ class DynamoNixlConnector:
         # used only when prefill TP > decode TP
         self._downscale_info = {}
 
+    def _down_peer_perm(self, group_size: int):
+        s = os.getenv("NIXL_DOWN_ORDER", "").strip()
+        if not s:
+            return list(range(group_size))
+        try:
+            parts = [int(x) for x in s.split(",")]
+            if sorted(parts) == list(range(group_size)):
+                return parts
+        except Exception:
+            pass
+        logger.warning("[DOWN-PERM] invalid NIXL_DOWN_ORDER=%r, fallback identity", s)
+        return list(range(group_size))
     def _sanitize_key(self, s: object, maxlen: int = 40) -> str:
         from uuid import uuid4
         s = str(s)
@@ -649,7 +661,11 @@ class DynamoNixlConnector:
             peer_idx = self.rank % group_size
             peer_offset = peer_idx * seg_len
 
-            # 角色信息（leader 只在组内最后一个）
+            perm = self._down_peer_perm(group_size)
+            slot = perm[peer_idx]
+            peer_offset = slot * seg_len
+
+
             notify_leader = (peer_idx == group_size - 1)
 
             # 先记录 downscale 元信息
@@ -658,9 +674,22 @@ class DynamoNixlConnector:
                 "remote_rank": remote_rank,
                 "peer_idx": peer_idx,
                 "notify_leader": notify_leader,
+                "perm": perm,
             }
 
-            # 立刻把 num_blocks 写进去，避免后面任何代码/日志访问 None
+            try:
+                heads_per_peer = max(1, (self.num_heads or 1) // group_size)
+                if perm == list(range(group_size)):
+                    h0 = slot * heads_per_peer
+                    h1 = h0 + heads_per_peer - 1
+                else:
+                    h0 = slot * heads_per_peer
+                    h1 = h0 + heads_per_peer - 1
+                logger.info("[DOWN-PERM] group=%d perm=%s peer_idx=%d -> slot=%d offset=%d heads[%d:%d]",
+                            group_size, perm, peer_idx, slot, peer_offset, h0, h1)
+            except Exception:
+                pass
+
             self.dst_num_blocks[engine_id] = num_blocks
 
             logger.info(
