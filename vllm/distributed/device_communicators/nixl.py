@@ -512,7 +512,7 @@ class DynamoNixlConnector:
                 leader = down.get("notify_leader")
                 if peer_idx is None or leader is None:
                     peer_idx = self.rank % group_size
-                    leader = (peer_idx == group_size - 1)
+                    leader = (peer_idx == 0)
                     down["peer_idx"] = peer_idx
                     down["notify_leader"] = leader
                 logger.info("[WRITE] path=DOWN remote_rank=%s group_size=%s peer_idx=%s leader=%s tp_mult=%s",
@@ -738,6 +738,7 @@ class DynamoNixlConnector:
 
             # 你要的规则：每组第一个当 leader（不再用“最后一个”）
             notify_leader = (peer_idx == 0)
+            leader = (slot == perm[0])
 
             # 记录元信息
             self._downscale_info[engine_id] = {
