@@ -88,6 +88,20 @@ class DynamoNixlConnector:
         # used only when prefill TP > decode TP
         self._downscale_info = {}
 
+    def _parse_down_order(self, group_size: int) -> list[int]:
+        env = os.getenv("NIXL_DOWN_ORDER", "").strip()
+        if env:
+            try:
+                order = [int(x) for x in env.split(",") if x != ""]
+            except Exception:
+                order = list(range(group_size))
+        else:
+            order = list(range(group_size))
+        # 兜底校验：必须是 0..group_size-1 的一个排列，否则回退自然顺序
+        ok = (len(order) == group_size and
+              sorted(order) == list(range(group_size)))
+        return order if ok else list(range(group_size))
+
     def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
         """对某层、某 entry(K=0/V=1)、某 block 的本地段做 32 位有符号整形求和（GPU->CPU）。
            只用于调试校验，不改变数据。
@@ -717,14 +731,15 @@ class DynamoNixlConnector:
             full_len = seg_len * group_size
             peer_idx = self.rank % group_size
 
-            # 可配置的 peer 拼接顺序（例如 NIXL_DOWN_ORDER=1,0）
-            perm = self._down_peer_perm(group_size)
+            # 统一用可控的段顺序（默认 0,1,...）
+            perm = self._parse_down_order(group_size)
             slot = perm[peer_idx]
             peer_offset = slot * seg_len
 
-            notify_leader = (peer_idx == group_size - 1)
+            # 你要的规则：每组第一个当 leader（不再用“最后一个”）
+            notify_leader = (peer_idx == 0)
 
-            # 记录 downscale 元信息
+            # 记录元信息
             self._downscale_info[engine_id] = {
                 "group_size": group_size,
                 "remote_rank": remote_rank,
@@ -737,8 +752,8 @@ class DynamoNixlConnector:
                 heads_per_peer = max(1, (self.num_heads or 1) // group_size)
                 h0 = slot * heads_per_peer
                 h1 = h0 + heads_per_peer - 1
-                logger.info("[DOWN-PERM] group=%d perm=%s peer_idx=%d -> slot=%d offset=%d heads[%d:%d]",
-                            group_size, perm, peer_idx, slot, peer_offset, h0, h1)
+                logger.info("[DOWN-PERM] group=%d perm=%s peer_idx=%d -> slot=%d offset=%d heads[%d:%d] leader=%s",
+                            group_size, perm, peer_idx, slot, peer_offset, h0, h1, notify_leader)
             except Exception:
                 pass
 
@@ -749,56 +764,66 @@ class DynamoNixlConnector:
                 group_size, remote_rank, peer_idx, notify_leader, seg_len, full_len, peer_offset
             )
 
-            # 句柄容器保底
+            # 保底：确保句柄容器已初始化
             if 1 not in self.src_xfer_side_handles:
                 self.src_xfer_side_handles[1] = None
             if engine_id not in self.dst_xfer_side_handles:
                 self.dst_xfer_side_handles[engine_id] = {}
 
-            swap_kv = os.getenv("NIXL_DOWN_SWAP_KV", "0") in ("1", "true", "True")
-            logger.info("[DOWN-KV] swap=%s", swap_kv)
-
+            # 本地（prefill）端 xfer 源描述：每层、每 entry、每 block，长度固定 seg_len
             local_dev_id = int(torch.cuda.current_device())
             src_blocks = []
             for layer in range(self.num_layers):
-                bases = self.kv_caches_base_addr[self.engine_id][layer]  # [key_base, value_base]
-                if swap_kv:
-                    bases = list(reversed(bases))
-                for base in bases:
+                for base in self.kv_caches_base_addr[self.engine_id][layer]:
                     for bid in range(self.num_blocks):
                         src_blocks.append((base + bid * seg_len, seg_len, local_dev_id))
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
+            # 远端（decode）端 xfer 目标描述：把本 peer 段写到 [bid*full_len + peer_offset]
             dst_blocks = []
             remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [key_base, value_base]
-                if swap_kv:
-                    layer_bases = list(reversed(layer_bases))
+                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
                 layer_dev_ids = None
                 if remote_dev_table is not None:
                     layer_dev_ids = remote_dev_table[remote_rank][layer]  # 与 bases 对齐的 dev 列表
 
+                # 对每个 entry 与 block 固定偏移：rbase + bid*full_len + peer_offset
                 for entry_idx, rbase in enumerate(layer_bases):
                     rdev = (layer_dev_ids[entry_idx] if layer_dev_ids is not None else int(remote_rank))
                     for bid in range(num_blocks):
-                        dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, rdev))
+                        dst_blocks.append((rbase + bid * full_len + peer_offset, seg_len, int(rdev)))
 
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
                 self._remote_agents[engine_id][remote_rank], dst_desc
             )
+
+            # —— 关键核对日志（把“谁/偏移/首末地址”打在一行）——
+            try:
+                first_dst = dst_blocks[0][0] if dst_blocks else None
+                last_dst = dst_blocks[-1][0] if dst_blocks else None
+                logger.info(
+                    "[ADD][DST-SUMMARY] engine=%s remote_rank=%d peer_idx=%d slot=%d "
+                    "offset=%d seg_len=%d full_len=%d first_dst=%s last_dst=%s",
+                    engine_id, remote_rank, peer_idx, slot, peer_offset, seg_len, full_len,
+                    first_dst, last_dst
+                )
+            except Exception:
+                pass
+
             logger.info("[ADD][TRACE] src_blocks[:10]=%s", src_blocks[:10])
             logger.info("[ADD][TRACE] dst_blocks[:10]=%s", dst_blocks[:10])
 
-            # 尝试建立连接（懒连接容错）
+            # 懒连接
             try:
                 self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
             except Exception as e:
                 logger.debug("make_connection(%s) failed (lazy connect): %s",
                              self._remote_agents[engine_id][remote_rank], e)
 
+            # down 场景为了简化后续 id 计算，把对端 TP 视为与本端相同
             self._tp_size[engine_id] = self._tp_size[self.engine_id]
 
             logger.info(
