@@ -88,6 +88,55 @@ class DynamoNixlConnector:
         # used only when prefill TP > decode TP
         self._downscale_info = {}
 
+    def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
+        """对某层、某 entry(K=0/V=1)、某 block 的本地段做 32 位有符号整形求和（GPU->CPU）。
+           只用于调试校验，不改变数据。
+        """
+        # 非 MLA：self.kv_caches[layer] 是 (key_cache, value_cache)
+        t = self.kv_caches[layer][entry_idx][block_id]  # shape: [block_size, num_heads_local, head_dim]
+        # 视图成 int32 做和，降低体积&对齐；结果取 python int
+        return int(t.view(torch.int32).sum().item())
+
+    def _down_verify_peer_segment(self, dst_engine_id: str,
+                                  remote_block_id: int,
+                                  scratch_block_id: Optional[int] = None,
+                                  max_layers: int = 2) -> None:
+        """将远端 remote_block_id 的“本 peer 段”读回到本地一个 scratch block，
+           然后分别对 K/V 做 32 位和校验，与本地原 block 对比。
+        """
+        if scratch_block_id is None:
+            scratch_block_id = (remote_block_id + 1) % max(1, self.num_blocks)
+
+        # 1) 读回远端 -> 本地 scratch（只读回本 peer 的半段；我们的 handle 就是半段）
+        self.read_blocks(
+            local_block_ids=[scratch_block_id],
+            staging_block_ids=[scratch_block_id],
+            remote_block_ids=[remote_block_id],
+            dst_engine_id=dst_engine_id,
+        )
+
+        # 2) 对比若干层（避免日志过长）
+        L = min(max_layers, self.num_layers)
+        k_ok = True
+        v_ok = True
+        for layer in range(L):
+            src_k = self._kv_block_u32sum(layer, 0, remote_block_id)
+            dst_k = self._kv_block_u32sum(layer, 0, scratch_block_id)
+            src_v = self._kv_block_u32sum(layer, 1, remote_block_id)
+            dst_v = self._kv_block_u32sum(layer, 1, scratch_block_id)
+            k_match = (src_k == dst_k)
+            v_match = (src_v == dst_v)
+            k_ok = k_ok and k_match
+            v_ok = v_ok and v_match
+            logger.info("[DOWN-CHK] engine=%s layer=%d block=%d -> scratch=%d "
+                        "K(sum32):%d==%d %s  V(sum32):%d==%d %s",
+                        dst_engine_id, layer, remote_block_id, scratch_block_id,
+                        src_k, dst_k, "OK" if k_match else "MISMATCH",
+                        src_v, dst_v, "OK" if v_match else "MISMATCH")
+        logger.info("[DOWN-CHK] summary: K=%s V=%s (layers checked=%d)",
+                    "OK" if k_ok else "MISMATCH",
+                    "OK" if v_ok else "MISMATCH", L)
+
     def _down_peer_perm(self, group_size: int):
         s = os.getenv("NIXL_DOWN_ORDER", "").strip()
         if not s:
@@ -588,6 +637,14 @@ class DynamoNixlConnector:
                     logger.info("[WRITE] follower: no final notify")
 
             logger.info("[WRITE] end ok dst=%s", dst_engine_id)
+
+            if os.getenv("NIXL_DOWN_VERIFY", "0") == "1":
+                try:
+                    # 只抽一个样本：各自校验自己刚写的第一个 block（remote_block_ids[0]）
+                    if remote_block_ids:
+                        self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
+                except Exception as e:
+                    logger.warning("[DOWN-CHK] verify failed: %s", e)
 
         except Exception as e:
             try:
