@@ -88,6 +88,56 @@ class DynamoNixlConnector:
         # used only when prefill TP > decode TP
         self._downscale_info = {}
 
+    def _sanitize_key(self, s: object, maxlen: int = 40) -> str:
+        from uuid import uuid4
+        s = str(s)
+        out = []
+        for ch in s:
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+            if len(out) >= maxlen:
+                break
+        return "".join(out) or uuid4().hex[:maxlen]
+
+    def _barrier_dir(self, dst_engine_id: str, notify_key: str, group_size: int) -> str:
+        base = os.getenv("NIXL_BARRIER_DIR", "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp")
+        safe_engine = self._sanitize_key(dst_engine_id, 16)
+        safe_key = self._sanitize_key(notify_key, 24)
+        d = os.path.join(base, f"nixl_down_bar_{safe_engine}_{safe_key}_{group_size}")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: str,
+                               group_size: int, peer_idx: int, is_leader: bool) -> None:
+        d = self._barrier_dir(dst_engine_id, notify_key, group_size)
+        my_flag = os.path.join(d, f"{peer_idx}.ok")
+        try:
+            with open(my_flag, "w") as f:
+                f.write("ok")
+        except Exception as e:
+            logger.warning("[DOWN-BAR] write flag failed: %s", e)
+
+        if not is_leader:
+            return
+        try:
+            for i in range(group_size):
+                flag = os.path.join(d, f"{i}.ok")
+                while not os.path.exists(flag):
+                    time.sleep(0.001)
+            # 清理
+            for i in range(group_size):
+                try:
+                    os.remove(os.path.join(d, f"{i}.ok"))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.warning("[DOWN-BAR] wait/cleanup failed: %s", e)
+
+
     @property
     def agent_name(self):
         return self.nixl_wrapper.name
@@ -440,12 +490,10 @@ class DynamoNixlConnector:
                             )
                 logger.info("[WRITE] rearrange_ms=%.3f", (time.perf_counter() - t0) * 1000)
 
-            # —— 先算远端 desc（修正你之前的 NameError/变量名不一致）——
             remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
             local_handle = self.src_xfer_side_handles[eff_tp]
             logger.info("[WRITE] desc lens: remote=%d local_eff_tp=%d", len(remote_desc_ids), eff_tp)
 
-            # ——（可选）映射预览：现在用正确的 remote_desc_ids ——
             if down is not None:
                 staging_desc_ids_preview = self._get_block_descs_ids(
                     self.engine_id, "all", staging_block_ids,
@@ -467,7 +515,6 @@ class DynamoNixlConnector:
                     raise RuntimeError("desc length mismatch")
                 remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
-                # 关键修复：up/equal 用 notify_payload_str，down 用空串（上面已设）
                 h = self.nixl_wrapper.make_prepped_xfer(
                     "WRITE",
                     local_handle, staging_desc_ids,
@@ -475,7 +522,6 @@ class DynamoNixlConnector:
                     notify_payload_str
                 )
 
-                # 只有非空的 notify（UP/EQ）才记录到 _transfers
                 if notify_payload_str:
                     self._transfers.setdefault(notify_payload_str, []).append(h)
 
@@ -507,16 +553,15 @@ class DynamoNixlConnector:
                         time.sleep(0.001)
                 logger.info("[WRITE] local_xfer_wait_ms=%.3f rounds=%d", (time.perf_counter() - t1) * 1000, rounds)
 
-                # 2) 不做 dist.barrier（vLLM 的 GroupCoordinator 不是 ProcessGroup）
                 try:
-                    from vllm.distributed import parallel_state as ps
-                    g = ps.get_tensor_model_parallel_group()
-                    logger.warning("[WRITE] DOWN: skip barrier (group=%s)",
-                                   type(g).__name__ if g is not None else "None")
-                except Exception as _e:
-                    logger.warning("[WRITE] DOWN: skip barrier (inspect group failed: %s)", _e)
+                    payload_key = _to_notify_str(notify_msg)  # 一般就是 request_id
+                    group_size = down.get("group_size", 1)
+                    peer_idx = down.get("peer_idx", 0)
+                    self._barrier_mark_and_wait(dst_engine_id, payload_key, group_size, peer_idx, down["notify_leader"])
+                    logger.info("[DOWN-BAR] group ready: peers=%s key=%s", group_size, payload_key)
+                except Exception as e:
+                    logger.warning("[DOWN-BAR] barrier failed (continue anyway): %s", e)
 
-                # 3) 只有 leader 显式发最终 notify
                 if down["notify_leader"]:
                     trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
                     payload = _to_notify_str(notify_msg)
