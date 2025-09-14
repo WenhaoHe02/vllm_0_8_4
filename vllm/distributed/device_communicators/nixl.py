@@ -88,6 +88,88 @@ class DynamoNixlConnector:
         # used only when prefill TP > decode TP
         self._downscale_info = {}
 
+    def _expand_blocks_to_tokens(self, block_ids: list[int]) -> list[int]:
+        # 展开：block_id -> block_id*block_size + [0..block_size-1]
+        B = int(self.block_size)
+        out = []
+        base_cache = {}
+        for b in block_ids:
+            base = base_cache.get(b)
+            if base is None:
+                base = b * B
+                base_cache[b] = base
+            out.extend(range(base, base + B))
+        return out
+
+    def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
+        down = self._downscale_info[dst_engine_id]
+        assert down is not None, "[WRITE-DOWN] downscale info missing"
+
+        # 1) 展开到 token 粒度
+        token_ids = self._expand_blocks_to_tokens(remote_block_ids)
+        # 本地同样是按 token 切好的 dlist（你现有 add_remote_agent(DOWN) 已经用 token_len_local 生成了）
+        staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)
+
+        # 2) 取 token 粒度的 desc id
+        remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)  # 注意：这里 token_ids
+        local_handle = self.src_xfer_side_handles[1]  # DOWN 固定用 key=1（token 粒度）
+        remote_handle = self.dst_xfer_side_handles[dst_engine_id][0]
+
+        # 3) 发送（DOWN：DMA 不带 notify；notify 独立在 barrier 后，仅 leader 发）
+        h = self.nixl_wrapper.make_prepped_xfer(
+            "WRITE",
+            local_handle, self._get_block_descs_ids(self.engine_id, "all", staging_token_ids, i=0, tp_multiplier=1),
+            remote_handle, remote_desc_ids,
+            ""  # 不带 payload
+        )
+        self.nixl_wrapper.transfer(h)
+
+        # 等 DONE
+        while True:
+            st = self.nixl_wrapper.check_xfer_state(h)
+            if st == "DONE":
+                break
+            if st != "PROC":
+                raise RuntimeError(f"[WRITE-DOWN] transfer failed: {st}")
+            time.sleep(0.001)
+
+        # barrier + 最终通知（仅 leader）
+        payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
+        self._barrier_mark_and_wait(dst_engine_id, payload, down["group_size"], down["peer_idx"], down["notify_leader"])
+        if down["notify_leader"]:
+            trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
+            self.nixl_wrapper.send_notif(trg, payload)
+
+    def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
+        down = self._downscale_info[dst_engine_id]
+        assert down is not None, "[READ-DOWN] downscale info missing"
+
+        # 1) 一样展开到 token 粒度（保持 1:1 长度）
+        token_ids = self._expand_blocks_to_tokens(remote_block_ids)
+        staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)  # 目标写到本地这些 token 切片
+
+        # 2) desc
+        local_handle = self.src_xfer_side_handles[1]
+        remote_handle = self.dst_xfer_side_handles[dst_engine_id][0]
+        remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)
+        staging_desc_ids = self._get_block_descs_ids(self.engine_id, "all", staging_token_ids, i=0, tp_multiplier=1)
+
+        # 3) 读（纯 DMA）
+        h = self.nixl_wrapper.make_prepped_xfer(
+            "READ",
+            local_handle, staging_desc_ids,
+            remote_handle, remote_desc_ids,
+            ""
+        )
+        self.nixl_wrapper.transfer(h)
+        while True:
+            st = self.nixl_wrapper.check_xfer_state(h)
+            if st == "DONE":
+                break
+            if st != "PROC":
+                raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
+            time.sleep(0.001)
+
     def _local_token_desc_ids(self, token_ids: list[int]) -> list[int]:
         """为 DOWN 场景构造本地 src 句柄的 token 粒度 desc 索引。
            顺序需与 add_remote_agent(DOWN) 里构造 src_desc 的循环一致：
@@ -412,6 +494,7 @@ class DynamoNixlConnector:
         downscale_info = self._downscale_info.get(dst_engine_id)
         tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
         if downscale_info is not None:
+            return self._read_blocks_down(local_block_ids, remote_block_ids, dst_engine_id)
             eff_tp, targets = 1, [0]
             logger.info("[READ] downscale active: remote_rank=%s group_size=%s -> eff_tp=1 targets=%s",
                         downscale_info.get("remote_rank"), downscale_info.get("group_size"), targets)
@@ -506,6 +589,7 @@ class DynamoNixlConnector:
 
             # ========= DOWN 分支 =========
             if down is not None:
+                return self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
                 rr = down["remote_rank"]
                 group_size = down.get("group_size") or (
                             self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id]))
