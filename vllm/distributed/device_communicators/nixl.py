@@ -662,7 +662,7 @@ class DynamoNixlConnector:
                         raise
 
                 logger.info("[WRITE] end ok dst=%s", dst_engine_id)
-                if os.getenv("NIXL_DOWN_VERIFY", "0") == "1":
+                if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
                     try:
                         if remote_block_ids:
                             self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
