@@ -108,7 +108,7 @@ class DynamoNixlConnector:
         # 1) 展开到 token 粒度
         token_ids = self._expand_blocks_to_tokens(remote_block_ids)
         # 本地同样是按 token 切好的 dlist（你现有 add_remote_agent(DOWN) 已经用 token_len_local 生成了）
-        staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)
+        staging_token_ids = self._expfand_blocks_to_tokens(local_block_ids)
 
         # 2) 取 token 粒度的 desc id
         remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)  # 注意：这里 token_ids
@@ -589,9 +589,9 @@ class DynamoNixlConnector:
 
             # ========= DOWN 分支 =========
             if down is not None:
-                return self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
+                self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
                 rr = down["remote_rank"]
-                group_size = down.get("group_size") or (
+                group_size = down.gets("group_size") or (
                             self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id]))
                 peer_idx = down.get("peer_idx", self.rank % group_size)
                 leader = down.get("notify_leader", (peer_idx == 0))
