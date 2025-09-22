@@ -938,22 +938,34 @@ class DynamoNixlConnector:
                 "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d slot=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d B=%d",
                 group_size, remote_rank, peer_idx, slot, token_len_local, token_len_total, full_len, seg_len, B)
 
-            # --- 构造本地（prefill）SRC 描述符：按 token 粒度 ---
             if 1 not in self.src_xfer_side_handles:
                 self.src_xfer_side_handles[1] = None
             local_dev_id = int(torch.cuda.current_device())
             src_blocks = []
+
+            # 使用 remote 的 num_blocks 来决定 src 的范围，保证 src/dst 描述符数量一致
+            if self.num_blocks < num_blocks:
+                # 如果本地比远端能放得少，这里选择抛错以免数据不完整；
+                # 也可以改成 pad zeros 或者做分批，但这需要更复杂的逻辑/协议。
+                logger.error("[ADD][DOWN] local num_blocks (%d) < remote num_blocks (%d): cannot construct src_blocks",
+                             self.num_blocks, num_blocks)
+                raise RuntimeError(
+                    f"[ADD][DOWN] local num_blocks ({self.num_blocks}) < remote num_blocks ({num_blocks})")
+
+            # 注意：这里用 range(num_blocks)（远端的块数），而不是 range(self.num_blocks)
             for layer in range(self.num_layers):
-                # bases order in kv_caches_base_addr[self.engine_id][layer] is [K_base, V_base]
                 bases = list(self.kv_caches_base_addr[self.engine_id][layer])
                 if swap_kv:
                     bases = list(reversed(bases))
                 for base in bases:
-                    for bid in range(self.num_blocks):
+                    # 只枚举 remote 的 block 索引数，确保总数与 dst_blocks 对齐
+                    for bid in range(num_blocks):
                         base_block = int(base + bid * seg_len)
                         for t in range(B):
                             src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
-            logger.debug("[ADD][DOWN] computed src_blocks count=%d (layers=%d)", len(src_blocks), self.num_layers)
+
+            logger.debug("[ADD][DOWN] computed src_blocks count=%d (layers=%d requested num_blocks=%d B=%d)",
+                         len(src_blocks), self.num_layers, num_blocks, B)
 
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
