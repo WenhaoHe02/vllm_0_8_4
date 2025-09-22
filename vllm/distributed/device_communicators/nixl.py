@@ -868,7 +868,7 @@ class DynamoNixlConnector:
             dst_blocks = []
             remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                layer_bases = self.kv_caches_base_addr[engine_id][layer]
+                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
                 layer_dev_ids = None
                 if remote_dev_table is not None:
                     layer_dev_ids = remote_dev_table[remote_rank][layer]
