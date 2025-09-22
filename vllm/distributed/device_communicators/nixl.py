@@ -304,26 +304,14 @@ class DynamoNixlConnector:
     def register_kv_caches(self, kv_caches: List[torch.Tensor]):
         logger.debug("--------------------------------")
         logger.debug("Registering kv caches for engine %s", self.engine_id)
-        logger.debug("Is deepseek: %s", self._is_mla)
-        try:
-            # 尝试打印 sample shapes safely
-            if self._is_mla:
-                logger.debug("kv_cache sample shape (mla): %s", getattr(kv_caches[0], "shape", None))
-            else:
-                # kv_caches[layer] == (key_cache, value_cache)
-                k0 = kv_caches[0][0] if isinstance(kv_caches[0], (list, tuple)) else kv_caches[0]
-                v0 = kv_caches[0][1] if isinstance(kv_caches[0], (list, tuple)) else None
-                logger.debug("kv_cache sample key shape: %s value shape: %s", getattr(k0, "shape", None),
-                             getattr(v0, "shape", None))
-        except Exception as e:
-            logger.warning("[KVREG] preview shapes failed: %s", e)
+        logger.debug(f"Is deepseek: {self._is_mla}")
+        logger.debug(f"kv_cache shape: {kv_caches[0].shape}")
         logger.debug("--------------------------------")
 
         if self._is_mla:
-            # MLA path (kept simple)
             num_blocks, block_size, head_dim = kv_caches[0].shape
             self.block_len = head_dim * block_size * kv_caches[0].element_size()
-            logger.debug("Per layer kv cache size (mla): %s", kv_caches[0].shape)
+            logger.debug("Per layer kv cache size: %s", kv_caches[0].shape)
             self.num_layers = len(kv_caches)
             self.num_blocks = num_blocks
             self.num_heads = 1
@@ -345,54 +333,35 @@ class DynamoNixlConnector:
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
         else:
-            # 非 MLA，期望 kv_caches[layer] == (key_cache, value_cache)
-            # 保护性读取 shape & elem_size
-            try:
-                key0 = kv_caches[0][0]
-                val0 = kv_caches[0][1]
-            except Exception as e:
-                logger.exception("[KVREG] kv_caches structure unexpected: %s", e)
-                raise
-
-            num_blocks, block_size, num_heads, head_dim = key0.shape
-            elem_size = key0.element_size()  # 字节
-            dtype = getattr(key0, "dtype", None)
-
-            # block_len in bytes = block_size * num_heads * head_dim * elem_size
-            self.block_len = int(block_size * num_heads * head_dim * elem_size)
-            self.block_size = int(block_size)
-            self.head_dim = int(head_dim)
-            logger.info("[KVREG] key dtype=%s elem_size=%d bytes", dtype, elem_size)
-
+            _, num_blocks, block_size, num_heads, head_dim = kv_caches[0].shape
+            self.block_len = block_size * num_heads * head_dim * kv_caches[0].element_size()
+            self.block_size = block_size
+            self.head_dim = head_dim
+            logger.debug("Per layer kv cache size: %s", kv_caches[0].shape)
             self.num_layers = len(kv_caches)
-            self.num_blocks = int(num_blocks)
-            self.num_heads = int(num_heads)
+            self.num_blocks = num_blocks
+            self.num_heads = num_heads
             self.kv_caches = kv_caches
             self.num_cache_entries = 2
-
             kv_caches_base_addr = []
             caches_data = []
             for key_cache, value_cache in kv_caches:
-                base_addr = int(key_cache.data_ptr())
-                region_len = int(self.num_cache_entries * self.num_blocks * self.block_len)
+                base_addr = key_cache.data_ptr()
+                region_len = self.num_cache_entries * num_blocks * self.block_len
                 caches_data.append((base_addr, region_len, self.rank, ""))
-                kv_caches_base_addr.append([int(key_cache.data_ptr()), int(value_cache.data_ptr())])
+                kv_caches_base_addr.append([key_cache.data_ptr(), value_cache.data_ptr()])
 
             self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
-            self.kv_caches_dev_ids.setdefault(self.engine_id, None)
-
-            # debug 打印一些关键数字，便于校验
-            logger.info(
-                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%d head_dim=%d block_size=%d",
-                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
-                self.block_len, elem_size, self.num_heads, self.head_dim, self.block_size)
-            logger.debug("[KVREG] sample base addrs (first layer): %s",
-                         kv_caches_base_addr[0] if kv_caches_base_addr else None)
 
             descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
-            logger.debug("Registering descs: %s", caches_data[:3])
+            logger.debug("Registering descs: %s", caches_data)
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
+            logger.info(
+                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%s head_dim=%s block_size=%s",
+                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
+                self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
+            )
 
     def get_agent_metadata(self):
         return self.nixl_wrapper.get_agent_metadata()
