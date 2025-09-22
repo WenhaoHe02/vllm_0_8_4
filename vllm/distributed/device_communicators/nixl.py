@@ -88,11 +88,9 @@ class DynamoNixlConnector:
         self.block_size = None
         self.head_dim = None
 
-        # used only when prefill TP > decode TP
         self._downscale_info = {}
 
     def _expand_blocks_to_tokens(self, block_ids: List[int]) -> List[int]:
-        # 展开：block_id -> block_id*block_size + [0..block_size-1]
         B = int(self.block_size)
         out = []
         base_cache = {}
@@ -108,17 +106,14 @@ class DynamoNixlConnector:
         down = self._downscale_info[dst_engine_id]
         assert down is not None, "[WRITE-DOWN] downscale info missing"
 
-        # 1) 展开到 token 粒度（保持 1:1 对齐）
         token_ids = self._expand_blocks_to_tokens(remote_block_ids)
         staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)
 
-        # 2) 取 token 粒度的 desc id（本地必须用 token 粒度索引）
         remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)
         local_handle = self.src_xfer_side_handles[1]  # token 粒度句柄
         remote_handle = self.dst_xfer_side_handles[dst_engine_id][0]
         local_desc_ids = self._local_token_desc_ids(staging_token_ids)
 
-        # 3) 发送（DMA 不带 notify；notify 独立在 barrier 后，仅 leader 发）
         h = self.nixl_wrapper.make_prepped_xfer(
             "WRITE",
             local_handle, local_desc_ids,
@@ -136,7 +131,6 @@ class DynamoNixlConnector:
                 raise RuntimeError(f"[WRITE-DOWN] transfer failed: {st}")
             time.sleep(0.001)
 
-        # barrier + 最终通知（仅 leader）
         payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
         self._barrier_mark_and_wait(
             dst_engine_id,
@@ -153,17 +147,14 @@ class DynamoNixlConnector:
         down = self._downscale_info[dst_engine_id]
         assert down is not None, "[READ-DOWN] downscale info missing"
 
-        # 1) 一样展开到 token 粒度（保持 1:1 长度）
         token_ids = self._expand_blocks_to_tokens(remote_block_ids)
         staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)  # 目标写到本地这些 token 切片
 
-        # 2) desc
         local_handle = self.src_xfer_side_handles[1]
         remote_handle = self.dst_xfer_side_handles[dst_engine_id][0]
         remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)
         staging_desc_ids = self._local_token_desc_ids(staging_token_ids)
 
-        # 3) 读（纯 DMA）
         h = self.nixl_wrapper.make_prepped_xfer(
             "READ",
             local_handle, staging_desc_ids,
@@ -180,14 +171,6 @@ class DynamoNixlConnector:
             time.sleep(0.001)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
-        """为 DOWN 场景构造本地 src 句柄的 token 粒度 desc 索引。
-           顺序需与 add_remote_agent(DOWN) 里构造 src_desc 的循环一致：
-             for layer in L:
-               for entry in [K,V]:
-                 for bid in range(num_blocks):
-                   for t in range(B):
-                     append(...)
-        """
         per_entry = self.num_blocks * self.block_size  # 每个 entry 的“单位”数：block×token
         ids = []
         for layer_id in range(self.num_layers):
@@ -198,9 +181,7 @@ class DynamoNixlConnector:
         return ids
 
     def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
-        """对某层、某 entry(K=0/V=1)、某 block 的本地段做 32 位有符号整形求和（GPU->CPU）。
-           只用于调试校验，不改变数据。
-        """
+
         t = self.kv_caches[layer][entry_idx][block_id]  # shape: [block_size, num_heads_local, head_dim]
         return int(t.view(torch.int32).sum().item())
 
@@ -211,10 +192,6 @@ class DynamoNixlConnector:
         scratch_block_id: Optional[int] = None,
         max_layers: int = 2,
     ) -> None:
-        """将远端 remote_block_id 的“本 peer 段”读回到本地一个 scratch block，
-           然后分别对 K/V 做 32 位和校验，与本地原 block 对比。
-           注意：read_blocks(DOWN) 会自动按 token 粒度展开。
-        """
         if scratch_block_id is None:
             scratch_block_id = (remote_block_id + 1) % max(1, self.num_blocks)
 
@@ -414,14 +391,12 @@ class DynamoNixlConnector:
         descs_ids = []
 
         if i is not None:
-            # 本地：根据 staging_ranges 做“重排后”的分片索引
             num_blocks = self.num_blocks
             for layer_id in layer_ids:
                 for entry_index in range(self.num_cache_entries):
                     staging_range_idx = 0
                     for block_id in block_ids:
                         if staging_ranges is not None:
-                            # 连续游标确保落在正确 staging 区间
                             while staging_range_idx < len(staging_ranges) and (
                                 block_id > staging_ranges[staging_range_idx][1]
                                 or block_id < staging_ranges[staging_range_idx][0]
@@ -521,7 +496,6 @@ class DynamoNixlConnector:
         downscale_info = self._downscale_info.get(dst_engine_id)
         tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
         if downscale_info is not None:
-            # DOWN：token 粒度搬运
             self._read_blocks_down(local_block_ids, remote_block_ids, dst_engine_id)
             return
         else:
@@ -610,13 +584,9 @@ class DynamoNixlConnector:
             def _to_notify_str(x):
                 return x if isinstance(x, str) else str(x)
 
-            # ========= DOWN 分支 =========
             if down is not None:
-                # 只做一次 DMA，等待 DONE；组内 barrier；仅 leader notify
                 self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
-
-                # 可选：写后校验（默认开启，设置 NIXL_DOWN_VERIFY=0 可关）
-                if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
+                if os.getenv("NIXL_DOWN_VERIFY", "0") == "1":
                     try:
                         if remote_block_ids:
                             self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
@@ -753,13 +723,11 @@ class DynamoNixlConnector:
             agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
         self._remote_agents[engine_id] = agent_names
 
-        # 保存远端 KV 基址/设备表
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
         self.kv_caches_dev_ids[engine_id] = kv_caches_dev_ids if kv_caches_dev_ids is not None else None
         loc_base = self.kv_caches_base_addr[engine_id]
         loc_dev = self.kv_caches_dev_ids[engine_id]
 
-        # 一致性校验
         assert len(agent_metadata) == agent_tp
         assert len(loc_base) == agent_tp
         for r in range(agent_tp):
@@ -771,17 +739,12 @@ class DynamoNixlConnector:
         logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                     tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
-        # ====================
-        # DOWN：prefill TP > decode TP，且非 MLA
-        # ====================
         if tp_multiplier == 0 and not self._is_mla:
             group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
             remote_rank = self.rank // group_size
             peer_idx = self.rank % group_size
-            slot = peer_idx  # 不做换位
+            slot = peer_idx
 
-            # 尺度（字节）
-            # block_len = B * H_local * C * elem
             B = int(self.block_size)
             token_len_local = self.block_len // B  # = H_local * C * bytes
             token_len_total = token_len_local * group_size  # = H_total * C * bytes
@@ -789,7 +752,6 @@ class DynamoNixlConnector:
             full_len = token_len_total * B  # = B * H_total * C * bytes
             peer_off_tok = slot * token_len_local
 
-            # 记录元信息
             self._downscale_info[engine_id] = {
                 "group_size": group_size,
                 "remote_rank": remote_rank,
@@ -799,14 +761,12 @@ class DynamoNixlConnector:
                 "token_granularity": True,
             }
 
-            # ***** 关键：远端 desc 的“单位数”按 token 粒度 *****
             self.dst_num_blocks[engine_id] = num_blocks * B
 
             logger.info(
                 "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d",
                 group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len)
 
-            # --- 构造本地（prefill）SRC 描述符：按 token 粒度 ---
             if 1 not in self.src_xfer_side_handles:
                 self.src_xfer_side_handles[1] = None
             local_dev_id = int(torch.cuda.current_device())
@@ -820,7 +780,6 @@ class DynamoNixlConnector:
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
-            # --- 构造远端（decode）DST 描述符：按 token 粒度 ---
             if engine_id not in self.dst_xfer_side_handles:
                 self.dst_xfer_side_handles[engine_id] = {}
             dst_blocks = []
@@ -835,7 +794,6 @@ class DynamoNixlConnector:
                     for bid in range(num_blocks):
                         base_block = rbase + bid * full_len
                         for t in range(B):
-                            # 注意：同一 token 内不同 peer 仅在 token 内偏移不同
                             dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
                                                token_len_local, int(rdev)))
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
@@ -849,7 +807,6 @@ class DynamoNixlConnector:
             except Exception as e:
                 logger.debug("make_connection(%s) lazy: %s", self._remote_agents[engine_id][remote_rank], e)
 
-            # 为简化后续 id 计算：把对端 TP 伪装成本端
             self._tp_size[engine_id] = self._tp_size[self.engine_id]
 
             logger.info("[ADD] downscale prepared: src_keys=%s dst_keys=%s dst_units(token)=%s",
@@ -858,9 +815,6 @@ class DynamoNixlConnector:
                         self.dst_num_blocks[engine_id])
             return agent_names
 
-        # ====================
-        # UP/EQ：保持原逻辑
-        # ====================
         assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
         dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
         logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
@@ -932,7 +886,6 @@ class DynamoNixlConnector:
             else:
                 self._transfers[req_id] = running
 
-        # 只有有完成项才打 info；空结果限频/降级
         if done_req_ids:
             logger.info("[DONE] report: count=%d keys=%s",
                         len(done_req_ids), done_req_ids[:8])
