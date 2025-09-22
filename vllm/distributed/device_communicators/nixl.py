@@ -470,6 +470,8 @@ class DynamoNixlConnector:
             return src_overlapping_ranges, dst_overlapping_ranges, original_src_ranges
         return src_overlapping_ranges, dst_overlapping_ranges
 
+    def _peek(xs, k=3):
+        return xs[:k] + (["..."] if len(xs) > k else [])
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         logger.info("[READ] local=%s staging=%s remote=%s dst_engine=%s",
                     len(local_block_ids), len(staging_block_ids), len(remote_block_ids), dst_engine_id)
@@ -509,8 +511,6 @@ class DynamoNixlConnector:
         if dst_engine_id not in self.dst_xfer_side_handles:
             raise RuntimeError(f"[READ] dst_xfer_side_handles missing for engine {dst_engine_id}")
 
-        def _peek(xs, k=3):
-            return xs[:k] + (["..."] if len(xs) > k else [])
 
         handles = []
         t0 = time.perf_counter()
@@ -523,7 +523,7 @@ class DynamoNixlConnector:
                 f"[READ] desc len mismatch: staging={len(staging_block_descs_ids)} remote={len(remote_block_descs_ids)}"
             remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
             logger.debug("[READ] i=%s staging_desc_ids_len=%s staging_head=%s remote_head=%s",
-                         i, len(staging_block_descs_ids), _peek(staging_block_descs_ids), _peek(remote_block_descs_ids))
+                         i, len(staging_block_descs_ids), self._peek(staging_block_descs_ids), self._peek(remote_block_descs_ids))
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "READ",
                 local_xfer_side_handle, staging_block_descs_ids,
@@ -591,7 +591,7 @@ class DynamoNixlConnector:
             if down is not None:
                 self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
                 rr = down["remote_rank"]
-                group_size = down.gets("group_size") or (
+                group_size = down.get("group_size") or (
                             self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id]))
                 peer_idx = down.get("peer_idx", self.rank % group_size)
                 leader = down.get("notify_leader", (peer_idx == 0))
@@ -766,7 +766,7 @@ class DynamoNixlConnector:
     def get_notifs(self):
         notifs = self.nixl_wrapper.update_notifs()
         if notifs:
-            logger.info("[NOTIF] update_notifs count=%d sample=%s", len(notifs), _peek(notifs, 4))
+            logger.info("[NOTIF] update_notifs count=%d sample=%s", len(notifs), self._peek(notifs, 4))
         else:
             logger.debug("[NOTIF] update_notifs empty")
         return notifs
