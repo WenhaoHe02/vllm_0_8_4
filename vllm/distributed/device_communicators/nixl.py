@@ -201,13 +201,16 @@ class DynamoNixlConnector:
                                   remote_block_id: int,
                                   scratch_block_id: Optional[int] = None,
                                   max_layers: int = 2) -> None:
-        """将远端 remote_block_id 的“本 peer 段”读回到本地一个 scratch block，
-           然后分别对 K/V 做 32 位和校验，与本地原 block 对比。
-           注意：read_blocks(DOWN) 会自动按 token 粒度展开。
+        """
+        将远端 remote_block_id 的“本 peer 段”读回到本地一个 scratch block，
+        然后分别对 K/V 做 32 位和校验，与本地原 block 对比。
+        增强版：打印每层每 entry 的原始 sum、dtype/elem_size，并在差异时打印前 32 bytes 的十六进制。
         """
         if scratch_block_id is None:
             scratch_block_id = (remote_block_id + 1) % max(1, self.num_blocks)
 
+        logger.info("[DOWN-CHK] starting verify dst=%s remote_block=%d -> scratch=%d max_layers=%d",
+                    dst_engine_id, remote_block_id, scratch_block_id, max_layers)
         # 触发一次 token 粒度 READ（内部会展开）
         self.read_blocks(
             local_block_ids=[scratch_block_id],
@@ -220,17 +223,63 @@ class DynamoNixlConnector:
         L = min(max_layers, self.num_layers)
         k_ok = True
         v_ok = True
+        # 获取 dtype/elem_size 基本信息（尽量安全读取）
+        try:
+            sample_key = self.kv_caches[0][0]
+            dtype = getattr(sample_key, "dtype", None)
+            elem_size = sample_key.element_size()
+        except Exception:
+            dtype = None
+            elem_size = None
+
+        logger.debug("[DOWN-CHK] sample dtype=%s elem_size=%s", dtype, elem_size)
+
         for layer in range(L):
-            src_k = self._kv_block_u32sum(layer, 0, remote_block_id)
-            dst_k = self._kv_block_u32sum(layer, 0, scratch_block_id)
-            src_v = self._kv_block_u32sum(layer, 1, remote_block_id)
-            dst_v = self._kv_block_u32sum(layer, 1, scratch_block_id)
+            # 原始 remote 段（在本地视角用 remote_block_id 索引）
+            try:
+                src_k = self._kv_block_u32sum(layer, 0, remote_block_id)
+                dst_k = self._kv_block_u32sum(layer, 0, scratch_block_id)
+                src_v = self._kv_block_u32sum(layer, 1, remote_block_id)
+                dst_v = self._kv_block_u32sum(layer, 1, scratch_block_id)
+            except Exception as e:
+                logger.exception("[DOWN-CHK] sum32 computation failed layer=%d: %s", layer, e)
+                raise
+
             k_ok = k_ok and (src_k == dst_k)
             v_ok = v_ok and (src_v == dst_v)
+
             logger.info("[DOWN-CHK] engine=%s layer=%d block=%d -> scratch=%d K:%d==%d %s V:%d==%d %s",
                         dst_engine_id, layer, remote_block_id, scratch_block_id,
                         src_k, dst_k, "OK" if src_k == dst_k else "MISMATCH",
                         src_v, dst_v, "OK" if src_v == dst_v else "MISMATCH")
+
+            # 差异时打印更详细的原始 bytes（只取前几个元素）
+            if src_k != dst_k or src_v != dst_v:
+                try:
+                    # 读取原始张量切片并显示前 few bytes hex，以便定位是偏移错误还是 value mismatch
+                    src_key_tensor = self.kv_caches[layer][0][
+                        remote_block_id]  # [block_size, num_heads_local, head_dim]
+                    src_val_tensor = self.kv_caches[layer][1][remote_block_id]
+                    scratch_key_tensor = self.kv_caches[layer][0][scratch_block_id]
+                    scratch_val_tensor = self.kv_caches[layer][1][scratch_block_id]
+
+                    # 把前几个元素导出为 bytes（按 storage）
+                    def _head_bytes(tensor, n_bytes=64):
+                        try:
+                            b = tensor.detach().cpu().numpy().tobytes()
+                            return b[:n_bytes].hex()
+                        except Exception as e:
+                            return f"error_dump:{e}"
+
+                    logger.debug("[DOWN-CHKBODY] layer=%d src_k_head_bytes=%s", layer, _head_bytes(src_key_tensor))
+                    logger.debug("[DOWN-CHKBODY] layer=%d src_v_head_bytes=%s", layer, _head_bytes(src_val_tensor))
+                    logger.debug("[DOWN-CHKBODY] layer=%d scratch_k_head_bytes=%s", layer,
+                                 _head_bytes(scratch_key_tensor))
+                    logger.debug("[DOWN-CHKBODY] layer=%d scratch_v_head_bytes=%s", layer,
+                                 _head_bytes(scratch_val_tensor))
+                except Exception as e:
+                    logger.exception("[DOWN-CHK] detailed dump failed: %s", e)
+
         logger.info("[DOWN-CHK] summary: K=%s V=%s (layers checked=%d)",
                     "OK" if k_ok else "MISMATCH",
                     "OK" if v_ok else "MISMATCH", L)
@@ -304,14 +353,26 @@ class DynamoNixlConnector:
     def register_kv_caches(self, kv_caches: List[torch.Tensor]):
         logger.debug("--------------------------------")
         logger.debug("Registering kv caches for engine %s", self.engine_id)
-        logger.debug(f"Is deepseek: {self._is_mla}")
-        logger.debug(f"kv_cache shape: {kv_caches[0].shape}")
+        logger.debug("Is deepseek: %s", self._is_mla)
+        try:
+            # 尝试打印 sample shapes safely
+            if self._is_mla:
+                logger.debug("kv_cache sample shape (mla): %s", getattr(kv_caches[0], "shape", None))
+            else:
+                # kv_caches[layer] == (key_cache, value_cache)
+                k0 = kv_caches[0][0] if isinstance(kv_caches[0], (list, tuple)) else kv_caches[0]
+                v0 = kv_caches[0][1] if isinstance(kv_caches[0], (list, tuple)) else None
+                logger.debug("kv_cache sample key shape: %s value shape: %s", getattr(k0, "shape", None),
+                             getattr(v0, "shape", None))
+        except Exception as e:
+            logger.warning("[KVREG] preview shapes failed: %s", e)
         logger.debug("--------------------------------")
 
         if self._is_mla:
+            # MLA path (kept simple)
             num_blocks, block_size, head_dim = kv_caches[0].shape
             self.block_len = head_dim * block_size * kv_caches[0].element_size()
-            logger.debug("Per layer kv cache size: %s", kv_caches[0].shape)
+            logger.debug("Per layer kv cache size (mla): %s", kv_caches[0].shape)
             self.num_layers = len(kv_caches)
             self.num_blocks = num_blocks
             self.num_heads = 1
@@ -333,35 +394,54 @@ class DynamoNixlConnector:
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
         else:
-            _, num_blocks, block_size, num_heads, head_dim = kv_caches[0].shape
-            self.block_len = block_size * num_heads * head_dim * kv_caches[0].element_size()
-            self.block_size = block_size
-            self.head_dim = head_dim
-            logger.debug("Per layer kv cache size: %s", kv_caches[0].shape)
+            # 非 MLA，期望 kv_caches[layer] == (key_cache, value_cache)
+            # 保护性读取 shape & elem_size
+            try:
+                key0 = kv_caches[0][0]
+                val0 = kv_caches[0][1]
+            except Exception as e:
+                logger.exception("[KVREG] kv_caches structure unexpected: %s", e)
+                raise
+
+            num_blocks, block_size, num_heads, head_dim = key0.shape
+            elem_size = key0.element_size()  # 字节
+            dtype = getattr(key0, "dtype", None)
+
+            # block_len in bytes = block_size * num_heads * head_dim * elem_size
+            self.block_len = int(block_size * num_heads * head_dim * elem_size)
+            self.block_size = int(block_size)
+            self.head_dim = int(head_dim)
+            logger.info("[KVREG] key dtype=%s elem_size=%d bytes", dtype, elem_size)
+
             self.num_layers = len(kv_caches)
-            self.num_blocks = num_blocks
-            self.num_heads = num_heads
+            self.num_blocks = int(num_blocks)
+            self.num_heads = int(num_heads)
             self.kv_caches = kv_caches
             self.num_cache_entries = 2
+
             kv_caches_base_addr = []
             caches_data = []
             for key_cache, value_cache in kv_caches:
-                base_addr = key_cache.data_ptr()
-                region_len = self.num_cache_entries * num_blocks * self.block_len
+                base_addr = int(key_cache.data_ptr())
+                region_len = int(self.num_cache_entries * self.num_blocks * self.block_len)
                 caches_data.append((base_addr, region_len, self.rank, ""))
-                kv_caches_base_addr.append([key_cache.data_ptr(), value_cache.data_ptr()])
+                kv_caches_base_addr.append([int(key_cache.data_ptr()), int(value_cache.data_ptr())])
 
             self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
+            self.kv_caches_dev_ids.setdefault(self.engine_id, None)
+
+            # debug 打印一些关键数字，便于校验
+            logger.info(
+                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%d head_dim=%d block_size=%d",
+                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
+                self.block_len, elem_size, self.num_heads, self.head_dim, self.block_size)
+            logger.debug("[KVREG] sample base addrs (first layer): %s",
+                         kv_caches_base_addr[0] if kv_caches_base_addr else None)
 
             descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
-            logger.debug("Registering descs: %s", caches_data)
+            logger.debug("Registering descs: %s", caches_data[:3])
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
-            logger.info(
-                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%s head_dim=%s block_size=%s",
-                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
-                self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
-            )
 
     def get_agent_metadata(self):
         return self.nixl_wrapper.get_agent_metadata()
@@ -820,16 +900,24 @@ class DynamoNixlConnector:
             group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
             remote_rank = self.rank // group_size
             peer_idx = self.rank % group_size
-            slot = peer_idx  # 不做换位
+
+            # 读取 perm 与 swap 控制
+            perm = self._down_peer_perm(group_size)
+            if not (0 <= peer_idx < len(perm)):
+                raise RuntimeError(f"[ADD][DOWN] invalid peer_idx={peer_idx} for perm={perm}")
+            slot = perm[peer_idx]
+
+            swap_kv = os.getenv("NIXL_DOWN_KV_SWAP", "1").strip() not in ("0", "false", "False")
+            logger.info("[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d perm=%s slot=%d swap_kv=%s",
+                        group_size, remote_rank, peer_idx, perm, slot, swap_kv)
 
             # 尺度（字节）
-            # block_len = B * H_local * C * elem
             B = int(self.block_size)
-            token_len_local = self.block_len // B  # = H_local * C * bytes
-            token_len_total = token_len_local * group_size  # = H_total * C * bytes
-            seg_len = token_len_local * B  # = B * H_local * C * bytes
-            full_len = token_len_total * B  # = B * H_total * C * bytes
-            peer_off_tok = slot * token_len_local
+            token_len_local = int(self.block_len // B)  # = H_local * C * bytes
+            token_len_total = int(token_len_local * group_size)  # = H_total * C * bytes
+            seg_len = int(token_len_local * B)  # = B * H_local * C * bytes
+            full_len = int(token_len_total * B)  # = B * H_total * C * bytes
+            peer_off_tok = int(slot * token_len_local)
 
             # 记录元信息
             self._downscale_info[engine_id] = {
@@ -837,16 +925,18 @@ class DynamoNixlConnector:
                 "remote_rank": remote_rank,
                 "peer_idx": peer_idx,
                 "notify_leader": (peer_idx == 0),
-                "perm": None,
+                "perm": perm,
+                "slot": slot,
+                "swap_kv": swap_kv,
                 "token_granularity": True,
             }
 
             # ***** 关键：远端 desc 的“单位数”按 token 粒度 *****
-            self.dst_num_blocks[engine_id] = num_blocks * B
+            self.dst_num_blocks[engine_id] = int(num_blocks * B)
 
             logger.info(
-                "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d",
-                group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len)
+                "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d slot=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d B=%d",
+                group_size, remote_rank, peer_idx, slot, token_len_local, token_len_total, full_len, seg_len, B)
 
             # --- 构造本地（prefill）SRC 描述符：按 token 粒度 ---
             if 1 not in self.src_xfer_side_handles:
@@ -854,11 +944,17 @@ class DynamoNixlConnector:
             local_dev_id = int(torch.cuda.current_device())
             src_blocks = []
             for layer in range(self.num_layers):
-                for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V
+                # bases order in kv_caches_base_addr[self.engine_id][layer] is [K_base, V_base]
+                bases = list(self.kv_caches_base_addr[self.engine_id][layer])
+                if swap_kv:
+                    bases = list(reversed(bases))
+                for base in bases:
                     for bid in range(self.num_blocks):
-                        base_block = base + bid * seg_len
+                        base_block = int(base + bid * seg_len)
                         for t in range(B):
                             src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
+            logger.debug("[ADD][DOWN] computed src_blocks count=%d (layers=%d)", len(src_blocks), self.num_layers)
+
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
@@ -868,18 +964,33 @@ class DynamoNixlConnector:
             dst_blocks = []
             remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                layer_bases = list(self.kv_caches_base_addr[engine_id][remote_rank][layer])
                 layer_dev_ids = None
                 if remote_dev_table is not None:
-                    layer_dev_ids = remote_dev_table[remote_rank][layer]
-                for entry_idx, rbase in enumerate(layer_bases):  # K、V
+                    layer_dev_ids = list(remote_dev_table[remote_rank][layer])
+
+                if swap_kv:
+                    layer_bases = list(reversed(layer_bases))
+                    if layer_dev_ids is not None:
+                        layer_dev_ids = list(reversed(layer_dev_ids))
+
+                for entry_idx, rbase in enumerate(layer_bases):
                     rdev = (layer_dev_ids[entry_idx] if layer_dev_ids is not None else int(remote_rank))
                     for bid in range(num_blocks):
-                        base_block = rbase + bid * full_len
+                        base_block = int(rbase + bid * full_len)
                         for t in range(B):
-                            # 注意：同一 token 内不同 peer 仅在 token 内偏移不同
                             dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
                                                token_len_local, int(rdev)))
+            logger.debug("[ADD][DOWN] computed dst_blocks count=%d", len(dst_blocks))
+
+            # sanity: src_blocks and dst_blocks must have equal unit counts
+            if len(src_blocks) != len(dst_blocks):
+                logger.error("[ADD][DOWN] desc count mismatch src=%d dst=%d", len(src_blocks), len(dst_blocks))
+                # 打印少量样例供排查
+                logger.debug("[ADD][DOWN] sample src_blocks[:6]=%s", src_blocks[:6])
+                logger.debug("[ADD][DOWN] sample dst_blocks[:6]=%s", dst_blocks[:6])
+                raise RuntimeError(f"[ADD][DOWN] desc count mismatch src={len(src_blocks)} dst={len(dst_blocks)}")
+
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
             self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
                 self._remote_agents[engine_id][remote_rank], dst_desc
