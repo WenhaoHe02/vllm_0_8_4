@@ -198,7 +198,7 @@ class DynamoNixlConnector:
         return int(t.view(torch.int32).sum().item())
 
     def _down_verify_peer_segment(self, dst_engine_id: str,
-                                  remote_block_id: int,
+                                  remote_blockf_id: int,
                                   scratch_block_id: Optional[int] = None,
                                   max_layers: int = 2) -> None:
         """将远端 remote_block_id 的“本 peer 段”读回到本地一个 scratch block，
@@ -868,7 +868,7 @@ class DynamoNixlConnector:
             dst_blocks = []
             remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
             for layer in range(self.num_layers):
-                layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                layer_bases = self.kv_caches_base_addr[engine_id][layer]
                 layer_dev_ids = None
                 if remote_dev_table is not None:
                     layer_dev_ids = remote_dev_table[remote_rank][layer]
@@ -913,7 +913,7 @@ class DynamoNixlConnector:
                 for base_addr in self.kv_caches_base_addr[self.engine_id][layer_id]:
                     for block_id in range(self.num_blocks):
                         block_offset = block_id * self.block_len
-                        for i in range(1 if self._is_mla else tp_multiplier):
+                        for i in range(1 if self._is_mla else tp_mulftiplier):
                             tp_off = i * dst_block_len
                             blocks_data.append((base_addr + block_offset + tp_off, dst_block_len, self.rank))
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
