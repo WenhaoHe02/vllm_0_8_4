@@ -322,21 +322,36 @@ class DynamoNixlConnector:
         return blocks
 
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg, batch_tokens=128):
+        """
+        DOWN 路径：prefill -> decode
+        - 逐 token 分批 DMA（K 后 V，严格 1:1）
+        - 仅 leader 的“最后一批”在 barrier 之后 piggyback 通知；不再单独 send_notif
+        """
+        import numpy as np  # 确保可用
+
         info = self._downscale_info[dst_engine_id]
+        assert info is not None, "[WRITE-DOWN] downscale info missing"
+
         B = int(self.block_size)
         tloc, ttot = info["token_len_local"], info["token_len_total"]
         seg_len, full_len = info["seg_len"], info["full_len"]
         peer_off, rrank = info["peer_off_tok"], info["remote_rank"]
         remote_agent = self._remote_agents[dst_engine_id][rrank]
+
         local_dev = int(torch.cuda.current_device())
         remote_dev_tbl = self.kv_caches_dev_ids.get(dst_engine_id)
 
-        # 设备号取法
+        # 设备号选择
         def _rdev(layer, entry):
             ids = (remote_dev_tbl[rrank][layer] if remote_dev_tbl is not None else None)
             return int(ids[entry]) if ids is not None else int(rrank)
 
-        handles = []
+        is_leader = bool(info["notify_leader"])
+        payload = notify_msg if isinstance(notify_msg, bytes) else str(notify_msg).encode()
+
+        handles = []  # 普通批次 (h, sh, dh)
+        leader_last = None  # 仅 leader：最后一批 (h_last, sh_last, dh_last)
+
         try:
             # 遍历层与 block 对
             for layer in range(self.num_layers):
@@ -344,11 +359,13 @@ class DynamoNixlConnector:
                 kR, vR = self.kv_caches_base_addr[dst_engine_id][rrank][layer]
                 k_rdev, v_rdev = _rdev(layer, 0), _rdev(layer, 1)
 
-                for l_bid, r_bid in zip(local_block_ids, remote_block_ids):
+                last_pair_idx = len(local_block_ids) - 1
+
+                for pair_idx, (l_bid, r_bid) in enumerate(zip(local_block_ids, remote_block_ids)):
                     # 该 block 的基址
-                    kL_blk = kL + l_bid * seg_len;
+                    kL_blk = kL + l_bid * seg_len
                     vL_blk = vL + l_bid * seg_len
-                    kR_blk = kR + r_bid * full_len;
+                    kR_blk = kR + r_bid * full_len
                     vR_blk = vR + r_bid * full_len
 
                     # 逐 token 分批
@@ -360,54 +377,64 @@ class DynamoNixlConnector:
                         t_idx = np.arange(t0, t1, dtype=np.uint64)
                         k_src_addr = kL_blk + t_idx * np.uint64(tloc)
                         v_src_addr = vL_blk + t_idx * np.uint64(tloc)
-                        # === 远端 K/V 子片地址（stride = ttot，带 peer_off） ===
+                        # === 远端 K/V 子片地址（stride=ttot，带 peer_off）===
                         k_dst_addr = kR_blk + t_idx * np.uint64(ttot) + np.uint64(peer_off)
                         v_dst_addr = vR_blk + t_idx * np.uint64(ttot) + np.uint64(peer_off)
 
-                        # 拼 Nx3：[(addr, len, dev)]，K 后接 V，确保与原实现顺序一致
+                        # 拼 Nx3（addr, len, dev），K 后接 V
                         k_src = np.stack(
-                            [k_src_addr, np.full(t_count, tloc, np.uint64), np.full(t_count, local_dev, np.uint64)], 1)
+                            [k_src_addr,
+                             np.full(t_count, tloc, np.uint64),
+                             np.full(t_count, local_dev, np.uint64)], 1)
                         v_src = np.stack(
-                            [v_src_addr, np.full(t_count, tloc, np.uint64), np.full(t_count, local_dev, np.uint64)], 1)
+                            [v_src_addr,
+                             np.full(t_count, tloc, np.uint64),
+                             np.full(t_count, local_dev, np.uint64)], 1)
                         k_dst = np.stack(
-                            [k_dst_addr, np.full(t_count, tloc, np.uint64), np.full(t_count, k_rdev, np.uint64)], 1)
+                            [k_dst_addr,
+                             np.full(t_count, tloc, np.uint64),
+                             np.full(t_count, k_rdev, np.uint64)], 1)
                         v_dst = np.stack(
-                            [v_dst_addr, np.full(t_count, tloc, np.uint64), np.full(t_count, v_rdev, np.uint64)], 1)
+                            [v_dst_addr,
+                             np.full(t_count, tloc, np.uint64),
+                             np.full(t_count, v_rdev, np.uint64)], 1)
 
                         src_np = np.concatenate([k_src, v_src], axis=0)  # 2*t_count x 3
                         dst_np = np.concatenate([k_dst, v_dst], axis=0)
 
-                        # 可选：确保 (dev, addr, len) 排序一致（DOWN 情况下我们构造本就按增序）
-                        # 如果你显式排序（稳定排序），两侧要用一致的 key：
-                        # order = np.lexsort((src_np[:,1], src_np[:,0], src_np[:,2]))  # len, addr, dev
-                        # src_np, dst_np = src_np[order], dst_np[order]
-
+                        # 生成 dlist + 句柄（保持旧版接口兼容：不传 is_sorted）
                         src_desc = self.nixl_wrapper.get_xfer_descs(src_np, "VRAM")
                         dst_desc = self.nixl_wrapper.get_xfer_descs(dst_np, "VRAM")
 
-                        src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc, backends=["UCX"])
-                        dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc, backends=["UCX"])
+                        sh = self.nixl_wrapper.prep_xfer_dlist("", src_desc, backends=["UCX"])
+                        dh = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc, backends=["UCX"])
 
-                        # 发起本批传输（indices 覆盖全体）
                         idx = np.arange(src_np.shape[0], dtype=np.int32)
-                        h = self.nixl_wrapper.make_prepped_xfer(
-                            "WRITE", src_hdl, idx, dst_hdl, idx, b"", backends=["UCX"], skip_desc_merge=True
-                        )
-                        self.nixl_wrapper.transfer(h)
-                        handles.append((h, src_hdl, dst_hdl))
 
-            # 等待全部完成（并发批）
+                        # 先构建不带通知的 req
+                        h = self.nixl_wrapper.make_prepped_xfer(
+                            "WRITE", sh, idx, dh, idx, b"", backends=["UCX"], skip_desc_merge=True
+                        )
+
+                        # 判定是否是“本 engine 的最后一批”
+                        is_last_batch_of_engine = (
+                                layer == self.num_layers - 1 and
+                                pair_idx == last_pair_idx and
+                                t1 == B
+                        )
+
+                        if is_leader and is_last_batch_of_engine:
+                            # 仅 leader：保留最后一批，稍后带通知 post
+                            leader_last = (h, sh, dh)
+                        else:
+                            # 其它批次立即 post
+                            self.nixl_wrapper.transfer(h)
+                            handles.append((h, sh, dh))
+
+            # 等待普通批全部完成
             _wait_many(self.nixl_wrapper, [h for (h, _, _) in handles])
 
-            # 组内 barrier + leader 通知
-            payload = notify_msg if isinstance(notify_msg, bytes) else str(notify_msg).encode()
-            self._barrier_mark_and_wait(dst_engine_id, payload, info["group_size"], info["peer_idx"],
-                                        info["notify_leader"])
-            if info["notify_leader"]:
-                self.nixl_wrapper.send_notif(remote_agent, payload)
-
-        finally:
-            # 统一释放句柄
+            # 释放普通批的 dlist 句柄
             for (_, sh, dh) in handles:
                 try:
                     self.nixl_wrapper.release_dlist_handle(sh)
@@ -415,6 +442,53 @@ class DynamoNixlConnector:
                     pass
                 try:
                     self.nixl_wrapper.release_dlist_handle(dh)
+                except:
+                    pass
+            handles.clear()
+
+            # 组内 barrier（所有 peer 都完成写入）
+            self._barrier_mark_and_wait(
+                dst_engine_id, payload, info["group_size"], info["peer_idx"], is_leader
+            )
+
+            # leader 在 barrier 通过后，post “最后一批 + 通知”
+            if is_leader:
+                if leader_last is None:
+                    # 极端：没有数据批，回退为单独通知，避免卡住对端
+                    self.nixl_wrapper.send_notif(remote_agent, payload)
+                else:
+                    h_last, sh_last, dh_last = leader_last
+                    # 利用 transfer 的 notif_msg 覆盖机制，绑上通知后再 post
+                    self.nixl_wrapper.transfer(h_last, payload)
+                    _wait_xfer(self.nixl_wrapper, h_last)
+                    try:
+                        self.nixl_wrapper.release_dlist_handle(sh_last)
+                    except:
+                        pass
+                    try:
+                        self.nixl_wrapper.release_dlist_handle(dh_last)
+                    except:
+                        pass
+
+        finally:
+            # 兜底释放（异常路径）
+            for (_, sh, dh) in handles:
+                try:
+                    self.nixl_wrapper.release_dlist_handle(sh)
+                except:
+                    pass
+                try:
+                    self.nixl_wrapper.release_dlist_handle(dh)
+                except:
+                    pass
+            if leader_last is not None:
+                _, sh_last, dh_last = leader_last
+                try:
+                    self.nixl_wrapper.release_dlist_handle(sh_last)
+                except:
+                    pass
+                try:
+                    self.nixl_wrapper.release_dlist_handle(dh_last)
                 except:
                     pass
 
