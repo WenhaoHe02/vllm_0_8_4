@@ -320,7 +320,7 @@ class DynamoNixlConnector:
                     blocks.append((addr, length, rdev))
         return blocks
 
-    def _write_blocks_down_fast(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg, batch_tokens=32):
+    def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg, batch_tokens=32):
         info = self._downscale_info[dst_engine_id]
         B = int(self.block_size)
         tloc, ttot = info["token_len_local"], info["token_len_total"]
