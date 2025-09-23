@@ -15,6 +15,7 @@ import time
 import uuid
 from collections import defaultdict
 from typing import List, Tuple, Optional
+import numpy as np
 
 import msgspec
 import torch
