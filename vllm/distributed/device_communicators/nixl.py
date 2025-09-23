@@ -320,76 +320,107 @@ class DynamoNixlConnector:
                     blocks.append((addr, length, rdev))
         return blocks
 
-    # ============ DOWN 写/读（按需临时 DLIST） ============
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        info = self._downscale_info[dst_engine_id]
+        info = self._downscale_info.get(dst_engine_id)
         assert info is not None, "[WRITE-DOWN] downscale info missing"
 
         t0_all = _now()
-        t0 = _now()
-        loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
-        rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
-        _tlog("WRITE.DOWN.token_ranges", t0, _now(),
-              local_blocks=len(local_block_ids), remote_blocks=len(remote_block_ids),
-              ranges_local=len(loc_tok_ranges), ranges_remote=len(rem_tok_ranges))
-        t1 = _now()
-        _tlog("WRITE.DOWN.build_segments", t1, _now(),
-              src_seg=len(src_blocks), dst_seg=len(dst_blocks))
 
-        # 估算字节数
-        total_bytes = sum(l for _, l, _ in src_blocks)  # write: src 和 dst 相等
-        _tlog("WRITE.DOWN.bytes", t1, t1, total=_fmt_bytes(total_bytes))
+        # 安全初始化，避免 UnboundLocalError
+        src_blocks, dst_blocks = [], []
+        src_desc = dst_desc = None
+        src_hdl = dst_hdl = None
+        total_bytes = 0
 
-        # --- get descs ---s
-        t2 = _now()
-        src_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)
-        dst_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)
+        try:
+            # 1) token ranges
+            t0 = _now()
+            loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
+            rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
+            if not loc_tok_ranges or not rem_tok_ranges:
+                raise ValueError(f"[WRITE-DOWN] empty token ranges: local={loc_tok_ranges}, remote={rem_tok_ranges}")
+            _tlog("WRITE.DOWN.token_ranges", t0, _now(),
+                  local_blocks=len(local_block_ids), remote_blocks=len(remote_block_ids),
+                  ranges_local=len(loc_tok_ranges), ranges_remote=len(rem_tok_ranges))
 
-        # 构建临时 DLIST
-        src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
-        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-        _tlog("WRITE.DOWN.get_descs", t2, _now(), src_desc=len(src_desc), dst_desc=len(dst_desc))
+            # 2) build segments
+            t1 = _now()
+            src_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)
+            dst_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)
+            _tlog("WRITE.DOWN.build_segments", t1, _now(),
+                  src_seg=len(src_blocks), dst_seg=len(dst_blocks))
 
-        t3 = _now()
-        src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
-        remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
-        dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc)
-        _tlog("WRITE.DOWN.prep_dlist", t3, _now())
+            total_bytes = sum(l for _, l, _ in src_blocks)
+            _tlog("WRITE.DOWN.bytes", t1, t1, total=_fmt_bytes(total_bytes))
 
-        # WRITE（不带 payload）
-        t4 = _now()
-        h = self.nixl_wrapper.make_prepped_xfer(
-            "WRITE",
-            src_hdl, list(range(len(src_desc))),
-            dst_hdl, list(range(len(dst_desc))),
-            ""
-        )
-        self.nixl_wrapper.transfer(h)
-        t4a = _now()
-        _wait_xfer(self.nixl_wrapper, h)
-        t4b = _now()
-        _tlog("WRITE.DOWN.make_xfer", t4, t4a)
-        _tlog("WRITE.DOWN.wait_dma", t4a, t4b, GBps=f"{_throughput(total_bytes, t4b - t4a):.2f}")
+            if len(src_blocks) != len(dst_blocks):
+                raise RuntimeError(f"[WRITE-DOWN] segment count mismatch: src={len(src_blocks)} dst={len(dst_blocks)}")
 
-        # 释放临时句柄
-        t5 = _now()
-        self.nixl_wrapper.release_dlist_handle(src_hdl)
-        self.nixl_wrapper.release_dlist_handle(dst_hdl)
-        _tlog("WRITE.DOWN.release_dlist", t5, _now())
+            # 3) descs
+            t2 = _now()
+            src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+            dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+            _tlog("WRITE.DOWN.get_descs", t2, _now(), src_desc=len(src_desc), dst_desc=len(dst_desc))
 
-        # 组内 barrier + leader notify
-        t6 = _now()
-        payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-        self._barrier_mark_and_wait(
-            dst_engine_id, payload, info["group_size"], info["peer_idx"], info["notify_leader"]
-        )
-        t6a = _now()
-        _tlog("WRITE.DOWN.barrier_wait", t6, t6a, group_size=info["group_size"], leader=info["notify_leader"])
-        if info["notify_leader"]:
-            tn0 = _now()
-            self.nixl_wrapper.send_notif(remote_agent, payload)
-            _tlog("WRITE.DOWN.notify", tn0, _now(), payload_len=len(payload))
-        _tlog("WRITE.DOWN.total", t0_all, _now(), bytes=_fmt_bytes(total_bytes))
+            # 4) prep dlist
+            t3 = _now()
+            src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
+            remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
+            dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc)
+            _tlog("WRITE.DOWN.prep_dlist", t3, _now())
+
+            # 5) DMA
+            t4 = _now()
+            h = self.nixl_wrapper.make_prepped_xfer(
+                "WRITE",
+                src_hdl, list(range(len(src_desc))),
+                dst_hdl, list(range(len(dst_desc))),
+                ""
+            )
+            self.nixl_wrapper.transfer(h)
+            t4a = _now()
+            _wait_xfer(self.nixl_wrapper, h)
+            t4b = _now()
+            _tlog("WRITE.DOWN.make_xfer", t4, t4a)
+            _tlog("WRITE.DOWN.wait_dma", t4a, t4b, GBps=f"{_throughput(total_bytes, t4b - t4a):.2f}")
+
+            # 6) barrier + notify
+            t6 = _now()
+            payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
+            self._barrier_mark_and_wait(
+                dst_engine_id, payload, info["group_size"], info["peer_idx"], info["notify_leader"]
+            )
+            t6a = _now()
+            _tlog("WRITE.DOWN.barrier_wait", t6, t6a, group_size=info["group_size"], leader=info["notify_leader"])
+            if info["notify_leader"]:
+                tn0 = _now()
+                self.nixl_wrapper.send_notif(remote_agent, payload)
+                _tlog("WRITE.DOWN.notify", tn0, _now(), payload_len=len(payload))
+
+            _tlog("WRITE.DOWN.total", t0_all, _now(), bytes=_fmt_bytes(total_bytes))
+
+        except Exception as e:
+            # 打印尽可能多的上下文，再抛出真实错误
+            logger.error(
+                "[WRITE-DOWN][FAIL] local_blocks=%d remote_blocks=%d src_seg=%s dst_seg=%s bytes=%s err=%s",
+                len(local_block_ids), len(remote_block_ids),
+                (len(src_blocks) if isinstance(src_blocks, list) else "NA"),
+                (len(dst_blocks) if isinstance(dst_blocks, list) else "NA"),
+                _fmt_bytes(total_bytes), repr(e)
+            )
+            raise
+        finally:
+            # 无论成功失败都释放临时句柄
+            try:
+                if src_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(src_hdl)
+            except Exception:
+                pass
+            try:
+                if dst_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(dst_hdl)
+            except Exception:
+                pass
 
     def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
         info = self._downscale_info[dst_engine_id]
