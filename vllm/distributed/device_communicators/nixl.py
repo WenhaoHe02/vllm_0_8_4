@@ -339,28 +339,25 @@ class DynamoNixlConnector:
             rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
             if not loc_tok_ranges or not rem_tok_ranges:
                 raise ValueError(f"[WRITE-DOWN] empty token ranges: local={loc_tok_ranges}, remote={rem_tok_ranges}")
-            _tlog("WRITE.DOWN.token_ranges", t0, _now(),
-                  local_blocks=len(local_block_ids), remote_blocks=len(remote_block_ids),
-                  ranges_local=len(loc_tok_ranges), ranges_remote=len(rem_tok_ranges))
+            _tlog("WRITE.DOWN.token_ranges", t0, _now())
 
             # 2) build segments
             t1 = _now()
             src_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)
             dst_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)
-            _tlog("WRITE.DOWN.build_segments", t1, _now(),
-                  src_seg=len(src_blocks), dst_seg=len(dst_blocks))
-
-            total_bytes = sum(l for _, l, _ in src_blocks)
-            _tlog("WRITE.DOWN.bytes", t1, t1, total=_fmt_bytes(total_bytes))
+            _tlog("WRITE.DOWN.build_segments", t1, _now(), src_seg=len(src_blocks), dst_seg=len(dst_blocks))
 
             if len(src_blocks) != len(dst_blocks):
                 raise RuntimeError(f"[WRITE-DOWN] segment count mismatch: src={len(src_blocks)} dst={len(dst_blocks)}")
+
+            total_bytes = sum(l for _, l, _ in src_blocks)
+            _tlog("WRITE.DOWN.bytes", t1, t1, total=_fmt_bytes(total_bytes))
 
             # 3) descs
             t2 = _now()
             src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
             dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-            _tlog("WRITE.DOWN.get_descs", t2, _now(), src_desc=len(src_desc), dst_desc=len(dst_desc))
+            _tlog("WRITE.DOWN.get_descs", t2, _now(), src_desc=len(src_blocks), dst_desc=len(dst_blocks))
 
             # 4) prep dlist
             t3 = _now()
@@ -373,8 +370,8 @@ class DynamoNixlConnector:
             t4 = _now()
             h = self.nixl_wrapper.make_prepped_xfer(
                 "WRITE",
-                src_hdl, list(range(len(src_desc))),
-                dst_hdl, list(range(len(dst_desc))),
+                src_hdl, list(range(len(src_blocks))),
+                dst_hdl, list(range(len(dst_blocks))),
                 ""
             )
             self.nixl_wrapper.transfer(h)
@@ -423,33 +420,81 @@ class DynamoNixlConnector:
                 pass
 
     def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
-        info = self._downscale_info[dst_engine_id]
+        info = self._downscale_info.get(dst_engine_id)
         assert info is not None, "[READ-DOWN] downscale info missing"
 
-        loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
-        rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
+        t0_all = _now()
+        src_blocks = dst_blocks = []
+        src_desc = dst_desc = None
+        src_hdl = dst_hdl = None
+        total_bytes = 0
 
-        # 和写相反：remote → local
-        dst_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)   # 本地作为目标
-        src_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)   # 远端作为源
+        try:
+            t0 = _now()
+            loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
+            rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
+            if not loc_tok_ranges or not rem_tok_ranges:
+                raise ValueError(f"[READ-DOWN] empty token ranges: local={loc_tok_ranges}, remote={rem_tok_ranges}")
+            _tlog("READ.DOWN.token_ranges", t0, _now())
 
-        src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
-        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-        remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
-        src_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, src_desc)
-        dst_hdl = self.nixl_wrapper.prep_xfer_dlist("", dst_desc)
+            # 和写相反：remote → local
+            t1 = _now()
+            dst_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)  # 本地作为目标
+            src_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)  # 远端作为源
+            _tlog("READ.DOWN.build_segments", t1, _now(), src_seg=len(src_blocks), dst_seg=len(dst_blocks))
 
-        h = self.nixl_wrapper.make_prepped_xfer(
-            "READ",
-            dst_hdl, list(range(len(dst_desc))),
-            src_hdl, list(range(len(src_desc))),
-            ""
-        )
-        self.nixl_wrapper.transfer(h)
-        _wait_xfer(self.nixl_wrapper, h)
+            if len(src_blocks) != len(dst_blocks):
+                raise RuntimeError(f"[READ-DOWN] segment count mismatch: src={len(src_blocks)} dst={len(dst_blocks)}")
 
-        self.nixl_wrapper.release_dlist_handle(src_hdl)
-        self.nixl_wrapper.release_dlist_handle(dst_hdl)
+            total_bytes = sum(l for _, l, _ in dst_blocks)
+            _tlog("READ.DOWN.bytes", t1, t1, total=_fmt_bytes(total_bytes))
+
+            t2 = _now()
+            src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+            dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+            _tlog("READ.DOWN.get_descs", t2, _now(), src_desc=len(src_blocks), dst_desc=len(dst_blocks))
+
+            remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
+            t3 = _now()
+            src_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, src_desc)
+            dst_hdl = self.nixl_wrapper.prep_xfer_dlist("", dst_desc)
+            _tlog("READ.DOWN.prep_dlist", t3, _now())
+
+            t4 = _now()
+            h = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                dst_hdl, list(range(len(dst_blocks))),
+                src_hdl, list(range(len(src_blocks))),
+                ""
+            )
+            self.nixl_wrapper.transfer(h)
+            t4a = _now()
+            _wait_xfer(self.nixl_wrapper, h)
+            t4b = _now()
+            _tlog("READ.DOWN.make_xfer", t4, t4a)
+            _tlog("READ.DOWN.wait_dma", t4a, t4b, GBps=f"{_throughput(total_bytes, t4b - t4a):.2f}")
+            _tlog("READ.DOWN.total", t0_all, _now(), bytes=_fmt_bytes(total_bytes))
+
+        except Exception as e:
+            logger.error(
+                "[READ-DOWN][FAIL] local_blocks=%d remote_blocks=%d src_seg=%s dst_seg=%s bytes=%s err=%s",
+                len(local_block_ids), len(remote_block_ids),
+                (len(src_blocks) if isinstance(src_blocks, list) else "NA"),
+                (len(dst_blocks) if isinstance(dst_blocks, list) else "NA"),
+                _fmt_bytes(total_bytes), repr(e)
+            )
+            raise
+        finally:
+            try:
+                if src_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(src_hdl)
+            except Exception:
+                pass
+            try:
+                if dst_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(dst_hdl)
+            except Exception:
+                pass
 
     # ============ 其它工具 ============
     def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
