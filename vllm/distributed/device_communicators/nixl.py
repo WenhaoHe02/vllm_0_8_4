@@ -382,9 +382,8 @@ class DynamoNixlConnector:
                         # order = np.lexsort((src_np[:,1], src_np[:,0], src_np[:,2]))  # len, addr, dev
                         # src_np, dst_np = src_np[order], dst_np[order]
 
-                        # 生成 dlist（标 is_sorted=True 可降低 prepare 开销）
-                        src_desc = self.nixl_wrapper.get_xfer_descs(src_np, "VRAM", is_sorted=True)
-                        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_np, "VRAM", is_sorted=True)
+                        src_desc = self.nixl_wrapper.get_xfer_descs(src_np, "VRAM")
+                        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_np, "VRAM")
 
                         src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc, backends=["UCX"])
                         dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc, backends=["UCX"])
