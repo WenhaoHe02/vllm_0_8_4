@@ -324,142 +324,122 @@ class DynamoNixlConnector:
         info = self._downscale_info.get(dst_engine_id)
         assert info is not None, "[WRITE-DOWN] downscale info missing"
 
-        B = int(self.block_size)
-        token_len_local = info["token_len_local"]
-        token_len_total = info["token_len_total"]
-        seg_len = info["seg_len"]  # B * token_len_local
-        full_len = info["full_len"]  # B * token_len_total
-        peer_off_tok = info["peer_off_tok"]
-        remote_rank = info["remote_rank"]
-        remote_agent = self._remote_agents[dst_engine_id][remote_rank]
-        remote_dev_tbl = self.kv_caches_dev_ids.get(dst_engine_id)
+        t0_all = _now()
 
-        # 逐 token 构造段，严格的 层->(K,V)->(l_bid,r_bid 对)->t 顺序，且保持调用者传入的 block 顺序
-        src_blocks: list[tuple[int, int, int]] = []
-        dst_blocks: list[tuple[int, int, int]] = []
-        local_dev_id = int(torch.cuda.current_device())
-        for layer in range(self.num_layers):
-            k_base_local, v_base_local = self.kv_caches_base_addr[self.engine_id][layer]
-            k_base_remote, v_base_remote = self.kv_caches_base_addr[dst_engine_id][remote_rank][layer]
-            # 远端设备 id（若未提供 dev 表，则默认用 remote_rank）
-            layer_dev_ids = (remote_dev_tbl[remote_rank][layer] if remote_dev_tbl is not None else None)
-            k_rdev = int(layer_dev_ids[0]) if layer_dev_ids is not None else int(remote_rank)
-            v_rdev = int(layer_dev_ids[1]) if layer_dev_ids is not None else int(remote_rank)
-
-            for (l_bid, r_bid) in zip(local_block_ids, remote_block_ids):
-                # 本地该 block 的 K/V 起始
-                base_block_k_local = k_base_local + l_bid * seg_len
-                base_block_v_local = v_base_local + l_bid * seg_len
-                # 远端该 block 的 K/V 起始（full width）
-                base_block_k_remote = k_base_remote + r_bid * full_len
-                base_block_v_remote = v_base_remote + r_bid * full_len
-
-                for t in range(B):
-                    # 源（本地 prefill peer）的一个 token 片
-                    src_blocks.append((base_block_k_local + t * token_len_local, token_len_local, local_dev_id))
-                    # 目的（远端 decode 全宽中的本 peer 子片）
-                    dst_blocks.append(
-                        (base_block_k_remote + t * token_len_total + peer_off_tok, token_len_local, k_rdev))
-
-                for t in range(B):
-                    src_blocks.append((base_block_v_local + t * token_len_local, token_len_local, local_dev_id))
-                    dst_blocks.append(
-                        (base_block_v_remote + t * token_len_total + peer_off_tok, token_len_local, v_rdev))
-
-        # 构造 desc 与 dlist（注意：不要对 handle 调 len）
-        src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
-        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-        src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
-        dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc)
+        # 为了安全初始化（避免 UnboundLocalError）
+        src_blocks = []
+        dst_blocks = []
+        src_desc = dst_desc = None
+        src_hdl = dst_hdl = None
 
         try:
-            nseg = len(src_blocks)  # 段数以 blocks 列表为准
-            idx = list(range(nseg))
-            h = self.nixl_wrapper.make_prepped_xfer(
-                "WRITE",
-                src_hdl, idx,
-                dst_hdl, idx,
-                ""  # DOWN：DMA 不携带 notify
-            )
+            # 1) 将本次要写入的 block 映射到 token 区间
+            loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
+            rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
+            if not loc_tok_ranges or not rem_tok_ranges:
+                raise ValueError(f"[WRITE-DOWN] empty token ranges: local={loc_tok_ranges}, remote={rem_tok_ranges}")
+
+            # 2) 构建一次性传输段（prefill 本地 → decode 远端）
+            src_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)  # 本地段
+            dst_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)  # 远端段（decode）
+
+            if len(src_blocks) != len(dst_blocks):
+                raise RuntimeError(f"[WRITE-DOWN] segment count mismatch: src={len(src_blocks)} dst={len(dst_blocks)}")
+
+            # 3) 生成 desc + dlist 句柄（一次性）
+            src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+            dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+            src_hdl = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
+            remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
+            dst_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, dst_desc)
+
+            # 4) DMA（prefill→decode），完成后等待
+            idx = list(range(len(src_blocks)))
+            h = self.nixl_wrapper.make_prepped_xfer("WRITE", src_hdl, idx, dst_hdl, idx, "")
             self.nixl_wrapper.transfer(h)
             _wait_xfer(self.nixl_wrapper, h)
 
-            # 组内 barrier + leader notify
+            # 5) 同步 +（leader）notify；随后把这些“远端 block”记为已驻留（decode 侧）
             payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
             self._barrier_mark_and_wait(dst_engine_id, payload, info["group_size"], info["peer_idx"],
                                         info["notify_leader"])
             if info["notify_leader"]:
                 self.nixl_wrapper.send_notif(remote_agent, payload)
+
+            # ——关键：标记 decode 已驻留的 remote blocks——
+            res = self._down_resident[dst_engine_id]
+            for b in remote_block_ids:
+                res.add(int(b))
+
+            logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
+
+        except Exception:
+            logger.error("[WRITE-DOWN][FAIL] local_blocks=%d remote_blocks=%d",
+                         len(local_block_ids), len(remote_block_ids))
+            raise
         finally:
-            # 释放临时句柄
+            # 释放一次性 dlist 句柄
             try:
-                self.nixl_wrapper.release_dlist_handle(src_hdl)
+                if src_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(src_hdl)
             except Exception:
                 pass
             try:
-                self.nixl_wrapper.release_dlist_handle(dst_hdl)
+                if dst_hdl is not None:
+                    self.nixl_wrapper.release_dlist_handle(dst_hdl)
             except Exception:
                 pass
 
     def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
-        info = self._downscale_info[dst_engine_id]
+        """
+        READ（DOWN 场景）：prefill 从 decode 拉【已存在】的 KV。
+        - remote_block_ids：decode 侧的 block 索引
+        - local_block_ids：prefill 侧要写入的 block 索引（1:1 对齐）
+        只对 decode 端“未驻留”的 remote block 发起读取，完全命中则跳过 DMA。
+        """
+        info = self._downscale_info.get(dst_engine_id)
         assert info is not None, "[READ-DOWN] downscale info missing"
 
-        B = int(self.block_size)
-        token_len_local = info["token_len_local"]
-        token_len_total = info["token_len_total"]
-        seg_len = info["seg_len"]
-        full_len = info["full_len"]
-        peer_off_tok = info["peer_off_tok"]
-        remote_rank = info["remote_rank"]
-        remote_agent = self._remote_agents[dst_engine_id][remote_rank]
-        remote_dev_tbl = self.kv_caches_dev_ids.get(dst_engine_id)
+        # 只拉“decode 未驻留”的远端 block
+        resident = self._down_resident.get(dst_engine_id, set())
+        miss_pairs = [(l, r) for (l, r) in zip(local_block_ids, remote_block_ids)
+                      if int(r) not in resident]
 
-        # READ：远端是源，本地是目的；顺序同上，确保 1:1
-        src_blocks: list[tuple[int, int, int]] = []  # remote
-        dst_blocks: list[tuple[int, int, int]] = []  # local
-        local_dev_id = int(torch.cuda.current_device())
-        for layer in range(self.num_layers):
-            k_base_local, v_base_local = self.kv_caches_base_addr[self.engine_id][layer]
-            k_base_remote, v_base_remote = self.kv_caches_base_addr[dst_engine_id][remote_rank][layer]
-            layer_dev_ids = (remote_dev_tbl[remote_rank][layer] if remote_dev_tbl is not None else None)
-            k_rdev = int(layer_dev_ids[0]) if layer_dev_ids is not None else int(remote_rank)
-            v_rdev = int(layer_dev_ids[1]) if layer_dev_ids is not None else int(remote_rank)
+        if not miss_pairs:
+            logger.info("[READ-DOWN] full-hit dst=%s hit=%d miss=0", dst_engine_id, len(remote_block_ids))
+            return
 
-            for (l_bid, r_bid) in zip(local_block_ids, remote_block_ids):
-                base_block_k_local = k_base_local + l_bid * seg_len
-                base_block_v_local = v_base_local + l_bid * seg_len
-                base_block_k_remote = k_base_remote + r_bid * full_len
-                base_block_v_remote = v_base_remote + r_bid * full_len
+        # 子集传输（只为缺的块做段）
+        local_block_ids = [l for (l, _) in miss_pairs]
+        remote_block_ids = [r for (_, r) in miss_pairs]
 
-                for t in range(B):
-                    # 远端（源）：全宽中的本 peer 子片
-                    src_blocks.append(
-                        (base_block_k_remote + t * token_len_total + peer_off_tok, token_len_local, k_rdev))
-                    # 本地（目的）：本 peer 的 token 片
-                    dst_blocks.append((base_block_k_local + t * token_len_local, token_len_local, local_dev_id))
-
-                for t in range(B):
-                    src_blocks.append(
-                        (base_block_v_remote + t * token_len_total + peer_off_tok, token_len_local, v_rdev))
-                    dst_blocks.append((base_block_v_local + t * token_len_local, token_len_local, local_dev_id))
+        # 构建一次性段：decode(远) → prefill(本)
+        # 注意这里“源=decode 远端”，“目标=prefill 本地”
+        loc_tok_ranges = self._token_ranges_from_blocks(local_block_ids)
+        rem_tok_ranges = self._token_ranges_from_blocks(remote_block_ids)
+        dst_blocks = self._down_build_src_segments(dst_engine_id, loc_tok_ranges)  # 本地（prefill）目标段
+        src_blocks = self._down_build_dst_segments(dst_engine_id, rem_tok_ranges)  # 远端（decode）源段
 
         src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
         dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-        src_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, src_desc)  # 远端句柄
-        dst_hdl = self.nixl_wrapper.prep_xfer_dlist("", dst_desc)  # 本地句柄
+
+        remote_agent = self._remote_agents[dst_engine_id][info["remote_rank"]]
+        src_hdl = self.nixl_wrapper.prep_xfer_dlist(remote_agent, src_desc)
+        dst_hdl = self.nixl_wrapper.prep_xfer_dlist("", dst_desc)
 
         try:
-            nseg = len(src_blocks)
-            idx = list(range(nseg))
-            h = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                dst_hdl, idx,  # 本地先
-                src_hdl, idx,  # 远端后
-                ""
-            )
+            idx = list(range(len(src_blocks)))
+            h = self.nixl_wrapper.make_prepped_xfer("READ", dst_hdl, idx, src_hdl, idx, "")
             self.nixl_wrapper.transfer(h)
             _wait_xfer(self.nixl_wrapper, h)
+
+            # 拉回成功后，把这些 remote 块也标记为“已驻留”（下次再来就是命中）
+            res = self._down_resident[dst_engine_id]
+            for _, r in miss_pairs:
+                res.add(int(r))
+
+            logger.info("[READ-DOWN] partial-miss dst=%s miss=%d",
+                        dst_engine_id, len(miss_pairs))
         finally:
             try:
                 self.nixl_wrapper.release_dlist_handle(src_hdl)
