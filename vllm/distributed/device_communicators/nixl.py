@@ -169,7 +169,8 @@ class DynamoNixlConnector:
         last_req_args = None  # 留给最终“带通知”的那一小批
 
         # 逐层/逐 entry 生成索引并切片
-        per_entry = self.num_blocks * self.block_size  # 每层每 entry 的 token 总数（用于计算基址偏移）
+        per_entry_src = int(self.num_blocks) * int(self.block_size)  # 本地 6553 * 64 = 419,392
+        per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
         # 将当前选择的 token_ids（相对某层/某entry）映射到全局 dlist 的索引：
         # idx = layer * (num_entries * per_entry) + entry * per_entry + tok_id
         for layer in range(self.num_layers):
@@ -185,8 +186,9 @@ class DynamoNixlConnector:
                 for lo, hi in self._chunk_iter(N, MAX_IOV):
                     # 构造当前批次的局部索引（Python list of ints）
                     # 这里用列表推导，规模 <= MAX_IOV，创建成本很低
-                    local_idx = [base_entry + t for t in token_ids_local[lo:hi]]
-                    remote_idx = [base_entry + t for t in token_ids_remote[lo:hi]]
+                    local_idx = [base_entry_src + t for t in token_ids_local[lo:hi]]
+                    # ✅ 远端索引 = 远端基址 + 远端 token id
+                    remote_idx = [base_entry_dst + t for t in token_ids_remote[lo:hi]]
 
                     # 最后一批留到 barrier 之后再发，且 piggyback 通知
                     last_req_args = (local_idx, remote_idx)
