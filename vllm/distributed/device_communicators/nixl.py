@@ -174,15 +174,13 @@ class DynamoNixlConnector:
         # 将当前选择的 token_ids（相对某层/某entry）映射到全局 dlist 的索引：
         # idx = layer * (num_entries * per_entry) + entry * per_entry + tok_id
         for layer in range(self.num_layers):
-            base_layer = layer * (self.num_cache_entries * per_entry)
-            for entry in range(self.num_cache_entries):  # 0:K, 1:V
-                base_entry = base_layer + entry * per_entry
+            base_layer_src = layer * (self.num_cache_entries * per_entry_src)
+            base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
+            for entry in range(self.num_cache_entries):
+                base_entry_src = base_layer_src + entry * per_entry_src
+                base_entry_dst = base_layer_dst + entry * per_entry_dst
 
-                # 就地切片：避免一次性构造巨型 Python list
-                # 我们用 range 索引 + 偏移的方式生成视图，按块发送
-                # 本地与远端的 token_id 列表长度一致
-                N = len(token_ids_local)
-                # 分块推进
+                N = len(token_ids_local)  # 与 token_ids_remote 等长
                 for lo, hi in self._chunk_iter(N, MAX_IOV):
                     # 构造当前批次的局部索引（Python list of ints）
                     # 这里用列表推导，规模 <= MAX_IOV，创建成本很低
