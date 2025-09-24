@@ -90,6 +90,36 @@ class DynamoNixlConnector:
 
         self._downscale_info = {}
 
+    def _wait_many(self, handles):
+        # 轻量轮询 + 退避
+        spins, SPIN_MAX = 0, 2000
+        sleep_us, SLEEP_MAX = 50, 2000
+        pending = list(handles)
+        while pending:
+            nxt = []
+            for h in pending:
+                st = self.nixl_wrapper.check_xfer_state(h)
+                if st == "DONE":
+                    continue
+                if st != "PROC":
+                    raise RuntimeError(f"[DOWN] transfer failed: {st}")
+                nxt.append(h)
+            if not nxt:
+                return
+            pending = nxt
+            if spins < SPIN_MAX:
+                spins += 1
+            else:
+                time.sleep(sleep_us / 1e6)
+                sleep_us = min(sleep_us * 2, SLEEP_MAX)
+
+    def _chunk_iter(self, total_len: int, chunk: int):
+        off = 0
+        while off < total_len:
+            end = min(off + chunk, total_len)
+            yield off, end
+            off = end
+
     def _expand_blocks_to_tokens(self, block_ids: List[int]) -> List[int]:
         B = int(self.block_size)
         out = []
@@ -103,45 +133,106 @@ class DynamoNixlConnector:
         return out
 
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        down = self._downscale_info[dst_engine_id]
-        assert down is not None, "[WRITE-DOWN] downscale info missing"
+        info = self._downscale_info[dst_engine_id]
+        assert info is not None, "[WRITE-DOWN] downscale info missing"
 
-        token_ids = self._expand_blocks_to_tokens(remote_block_ids)
-        staging_token_ids = self._expand_blocks_to_tokens(local_block_ids)
+        # 环境变量可调参数（有默认值）
+        MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))  # 每个请求携带的索引上限
+        MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))  # 并发请求窗口
+        BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
-        remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", token_ids)
-        local_handle = self.src_xfer_side_handles[1]  # token 粒度句柄
-        remote_handle = self.dst_xfer_side_handles[dst_engine_id][0]
-        local_desc_ids = self._local_token_desc_ids(staging_token_ids)
+        # 预构：我们依赖 add_remote_agent(DOWN) 里已经建好的 token 粒度 src/dst 句柄
+        assert 1 in self.src_xfer_side_handles, "[WRITE-DOWN] missing src token handle"
+        assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
+            "[WRITE-DOWN] missing dst token handle"
 
-        h = self.nixl_wrapper.make_prepped_xfer(
+        src_hdl = self.src_xfer_side_handles[1]
+        dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]
+
+        # 把“这次要搬的 block 列表”展开为 token 索引（单位：token）
+        # 注意：我们对 local/remote 分别展开，然后用同样的层×entry 顺序拼索引，保证一一对应
+        token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
+        token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
+
+        # 构造“本次传输”的索引序列，但不一次性传给 API，而是下面按 MAX_IOV 切片
+        # 顺序 = 按 layer → entry(K/V) → token
+        # （与 add_remote_agent 里预构 dlist 的顺序完全一致）
+        # 为了避免一次性分配 40+ 万长度的大列表带来的 Python 压力，
+        # 这里逐层生成并切片发送。
+        notify_payload = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
+        remote_rank = info["remote_rank"]
+        remote_agent = self._remote_agents[dst_engine_id][remote_rank]
+        is_leader = bool(info["notify_leader"])
+
+        inflight = []
+        total_reqs = 0
+        last_req_args = None  # 留给最终“带通知”的那一小批
+
+        # 逐层/逐 entry 生成索引并切片
+        per_entry = self.num_blocks * self.block_size  # 每层每 entry 的 token 总数（用于计算基址偏移）
+        # 将当前选择的 token_ids（相对某层/某entry）映射到全局 dlist 的索引：
+        # idx = layer * (num_entries * per_entry) + entry * per_entry + tok_id
+        for layer in range(self.num_layers):
+            base_layer = layer * (self.num_cache_entries * per_entry)
+            for entry in range(self.num_cache_entries):  # 0:K, 1:V
+                base_entry = base_layer + entry * per_entry
+
+                # 就地切片：避免一次性构造巨型 Python list
+                # 我们用 range 索引 + 偏移的方式生成视图，按块发送
+                # 本地与远端的 token_id 列表长度一致
+                N = len(token_ids_local)
+                # 分块推进
+                for lo, hi in self._chunk_iter(N, MAX_IOV):
+                    # 构造当前批次的局部索引（Python list of ints）
+                    # 这里用列表推导，规模 <= MAX_IOV，创建成本很低
+                    local_idx = [base_entry + t for t in token_ids_local[lo:hi]]
+                    remote_idx = [base_entry + t for t in token_ids_remote[lo:hi]]
+
+                    # 最后一批留到 barrier 之后再发，且 piggyback 通知
+                    last_req_args = (local_idx, remote_idx)
+                    # 其余先发（不带通知）
+                    # 通过滑动窗口控制并发
+                    if (hi < N) or (entry < self.num_cache_entries - 1) or (layer < self.num_layers - 1):
+                        h = self.nixl_wrapper.make_prepped_xfer(
+                            "WRITE",
+                            src_hdl, local_idx,
+                            dst_hdl, remote_idx,
+                            b"",  # 不带 payload
+                            backends=BACKENDS
+                        )
+                        self.nixl_wrapper.transfer(h)
+                        inflight.append(h)
+                        total_reqs += 1
+                        if len(inflight) >= MAX_INFLIGHT:
+                            self._wait_many(inflight)
+                            inflight.clear()
+
+        # 等非最后一批全部完成
+        if inflight:
+            self._wait_many(inflight)
+            inflight.clear()
+
+        # 组内 barrier：只有 leader 等全员到齐
+        self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
+
+        # 发送“最后一小批 + 通知”
+        if last_req_args is None:
+            # 极端：这次实际上没有要搬的 token，leader 仍需发通知防止 decode 端等待
+            if is_leader:
+                self.nixl_wrapper.send_notif(remote_agent, notify_payload)
+            return
+
+        local_idx, remote_idx = last_req_args
+        h_last = self.nixl_wrapper.make_prepped_xfer(
             "WRITE",
-            local_handle, local_desc_ids,
-            remote_handle, remote_desc_ids,
-            ""  # 不带 payload
+            src_hdl, local_idx,
+            dst_hdl, remote_idx,
+            notify_payload,  # 只在最后一批带通知
+            backends=BACKENDS
         )
-        self.nixl_wrapper.transfer(h)
-
-        # 等 DONE
-        while True:
-            st = self.nixl_wrapper.check_xfer_state(h)
-            if st == "DONE":
-                break
-            if st != "PROC":
-                raise RuntimeError(f"[WRITE-DOWN] transfer failed: {st}")
-            time.sleep(0.001)
-
-        payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-        self._barrier_mark_and_wait(
-            dst_engine_id,
-            payload,
-            down["group_size"],
-            down["peer_idx"],
-            down["notify_leader"],
-        )
-        if down["notify_leader"]:
-            trg = self._remote_agents[dst_engine_id][down["remote_rank"]]
-            self.nixl_wrapper.send_notif(trg, payload)
+        self.nixl_wrapper.transfer(h_last)
+        self._wait_many([h_last])
+        logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
 
     def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
         down = self._downscale_info[dst_engine_id]
