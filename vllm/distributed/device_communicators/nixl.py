@@ -96,6 +96,7 @@ class DynamoNixlConnector:
             enabled=_env_flag("NIXL_TIMING", True),
             tag=os.getenv("NIXL_TIMING_TAG", f"nixl.{engine_id}.r{rank}")
         )
+        self._timing_autolog = _env_flag("NIXL_TIMING_LOG", False)
 
     def _wait_many(self, handles):
         with self._timing.span("wait_many"):
@@ -609,6 +610,11 @@ class DynamoNixlConnector:
             tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
             if downscale_info is not None:
                 self._read_blocks_down(local_block_ids, remote_block_ids, dst_engine_id)
+                # 自动或手动打印计时
+                if self._timing_autolog:
+                    stats = self.get_timing(reset=True)
+                    if stats:
+                        logger.info("[TIMING][READ-DOWN] %s", stats)
                 return
             else:
                 eff_tp = max(1, tp_multiplier)
@@ -684,6 +690,12 @@ class DynamoNixlConnector:
                         (time.perf_counter() - t2) * 1000.0,
                         (time.perf_counter() - start_time) * 1000.0)
 
+            # 自动或手动打印计时
+            if self._timing_autolog:
+                stats = self.get_timing(reset=True)
+                if stats:
+                    logger.info("[TIMING][READ] %s", stats)
+
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         with self._timing.span("write_blocks"):
             try:
@@ -712,6 +724,11 @@ class DynamoNixlConnector:
                         except Exception as e:
                             logger.warning("[DOWN-CHK] verify failed: %s", e)
                     logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
+                    # 自动或手动打印计时
+                    if self._timing_autolog:
+                        stats = self.get_timing(reset=True)
+                        if stats:
+                            logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
                 # ========= UP/EQ 分支 =========
@@ -734,6 +751,11 @@ class DynamoNixlConnector:
                         trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
                         self.nixl_wrapper.send_notif(trg, _to_notify_str(notify_msg))
                     logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
+                    # 自动或手动打印计时
+                    if self._timing_autolog:
+                        stats = self.get_timing(reset=True)
+                        if stats:
+                            logger.info("[TIMING][WRITE] %s", stats)
                     return
 
                 if do_rearrange:
@@ -802,6 +824,12 @@ class DynamoNixlConnector:
                 logger.info("[WRITE] local_xfer_wait_ms=%.3f", (time.perf_counter() - t1) * 1000)
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
 
+                # 自动或手动打印计时
+                if self._timing_autolog:
+                    stats = self.get_timing(reset=True)
+                    if stats:
+                        logger.info("[TIMING][WRITE] %s", stats)
+
             except Exception as e:
                 try:
                     logger.error(
@@ -839,7 +867,7 @@ class DynamoNixlConnector:
         with self._timing.span("add_remote_agent"):
             logger.info("[ADD] num_blocks=%d dev_ids=%s", num_blocks, "Y" if kv_caches_dev_ids is not None else "N")
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
-                        engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
+                engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
             self._tp_size[engine_id] = int(agent_tp)
 
