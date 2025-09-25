@@ -1107,7 +1107,7 @@ class DynamoNixlConnector:
     def get_done_tranfers(self) -> List[str]:
         with self._timing.span("get_done_transfers"):
             done_req_ids: List[str] = []
-            for req_id, handles in list(self._transfers.itesms()):
+            for req_id, handles in list(self._transfers.items()):
                 if not isinstance(req_id, str) or req_id == "":
                     logger.error("[DONE] illegal key (drop): type=%s repr=%r",
                                  type(req_id).__name__, req_id)
