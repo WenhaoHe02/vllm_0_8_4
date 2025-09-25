@@ -252,100 +252,90 @@ class DynamoNixlConnector:
             logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
 
     def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
-        """
-        DOWN 模式：从 decode 端（远端）把 remote_block_ids 的 token 片段
-        读到本端 staging 的 local_block_ids 上。
-        采用“按 token 预构 dlist + IOV 切片 + 滑窗并发”来降低单次 IOV 压力。
-        """
         info = self._downscale_info[dst_engine_id]
         assert info is not None, "[READ-DOWN] downscale info missing"
 
-        # 环境变量可调
-        MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))  # 每个请求最多的索引数
-        MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))  # 同时在飞请求数
+        B = int(self.block_size)
+        # —— 这些是“本次要搬”的 token 索引（注意：这里的 remote_* 必须是远端的 token 空间）
+        remote_token_ids = self._expand_blocks_to_tokens(remote_block_ids)
+        local_token_ids = self._expand_blocks_to_tokens(local_block_ids)  # 落到本地 staging 的 token 片
 
-        # 句柄：add_remote_agent(DOWN) 已经按 token 粒度预构好了
-        assert 1 in self.src_xfer_side_handles, "[READ-DOWN] missing local token handle"
-        assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
-            "[READ-DOWN] missing remote token handle"
-        local_hdl = self.src_xfer_side_handles[1]  # 本地（staging）的 token 句柄
-        remote_hdl = self.dst_xfer_side_handles[dst_engine_id][0]  # 远端（decode）的 token 句柄
+        # 取到预构的 token 粒度句柄
+        src_hdl = self.src_xfer_side_handles[1]  # 本地（staging）token句柄
+        dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]  # 远端（decode）token句柄
 
-        # 注意：这里的 local_block_ids 指的是“本地 staging 目标块”，remote_block_ids 是远端源块
-        staging_tok_ids = self._expand_blocks_to_tokens(local_block_ids)
-        remote_tok_ids = self._expand_blocks_to_tokens(remote_block_ids)
-        assert len(staging_tok_ids) == len(remote_tok_ids), "[READ-DOWN] token count mismatch"
+        # ===== 显式用“远端 token 步长”构造远端索引 =====
+        # 远端每层每entry的 token 数（= 远端 num_blocks * B）
+        dst_tok_cnt = int(self.dst_num_blocks[dst_engine_id])
+        # 本地每层每entry的 token 数（= 本地 num_blocks * B）
+        src_tok_cnt = int(self.num_blocks) * B
 
-        # 计时
-        import time
-        t_all0 = time.perf_counter_ns()
-        xfer_wait_ns = 0
+        # 快速边界检查：token_id 都必须 < 对应 tok_cnt
+        assert remote_token_ids and local_token_ids, "[READ-DOWN] empty token list"
+        assert max(remote_token_ids) < dst_tok_cnt, \
+            f"[READ-DOWN] remote token id OOB: max={max(remote_token_ids)} dst_tok_cnt={dst_tok_cnt}"
+        assert max(local_token_ids) < src_tok_cnt, \
+            f"[READ-DOWN] local token id OOB: max={max(local_token_ids)} src_tok_cnt={src_tok_cnt}"
 
-        # 索引映射：与预构 dlist 的顺序严格一致（layer -> entry(K/V) -> token）
-        per_entry = self.num_blocks * self.block_size  # 每层每 entry 的 token 总数
+        # 远端/本地的“跨层跨entry”的全局索引构造器
+        def _mk_remote_indices(tok_list):
+            # 索引 = layer * (entries * dst_tok_cnt) + entry * dst_tok_cnt + tok
+            out = []
+            layer_stride = self.num_cache_entries * dst_tok_cnt
+            for layer in range(self.num_layers):
+                base_layer = layer * layer_stride
+                for entry in range(self.num_cache_entries):  # 0:K, 1:V
+                    base_entry = base_layer + entry * dst_tok_cnt
+                    out.extend(base_entry + t for t in tok_list)
+            return out
 
-        inflight = []
-        chunks = 0
+        def _mk_local_indices(tok_list):
+            # 本地 staging 句柄同样是 token 粒度，但步长是“本地”的
+            out = []
+            layer_stride = self.num_cache_entries * src_tok_cnt
+            for layer in range(self.num_layers):
+                base_layer = layer * layer_stride
+                for entry in range(self.num_cache_entries):
+                    base_entry = base_layer + entry * src_tok_cnt
+                    out.extend(base_entry + t for t in tok_list)
+            return out
 
-        # 分层/分 entry 遍历，把本次要搬的 token 索引按 MAX_IOV 切片
-        for layer in range(self.num_layers):
-            base_layer = layer * (self.num_cache_entries * per_entry)
-            for entry in range(self.num_cache_entries):  # 0:K, 1:V
-                base_entry = base_layer + entry * per_entry
+        remote_desc_ids = _mk_remote_indices(remote_token_ids)
+        local_desc_ids = _mk_local_indices(local_token_ids)
 
-                N = len(staging_tok_ids)
-                # 分片推进
-                off = 0
-                while off < N:
-                    hi = min(off + MAX_IOV, N)
-                    # 当前批次局部索引
-                    loc_idx = [base_entry + t for t in staging_tok_ids[off:hi]]
-                    rmt_idx = [base_entry + t for t in remote_tok_ids[off:hi]]
+        # 再做一次总长度越界保护，能把问题一次性打全
+        total_remote = self.num_layers * self.num_cache_entries * dst_tok_cnt
+        total_local = self.num_layers * self.num_cache_entries * src_tok_cnt
+        if remote_desc_ids and (remote_desc_ids[-1] >= total_remote or min(remote_desc_ids) < 0):
+            raise RuntimeError(
+                "[READ-DOWN] remote indices OOB: "
+                f"min={min(remote_desc_ids)} max={max(remote_desc_ids)} total={total_remote} "
+                f"(layers={self.num_layers} entries={self.num_cache_entries} dst_tok_cnt={dst_tok_cnt})"
+            )
+        if local_desc_ids and (local_desc_ids[-1] >= total_local or min(local_desc_ids) < 0):
+            raise RuntimeError(
+                "[READ-DOWN] local indices OOB: "
+                f"min={min(local_desc_ids)} max={max(local_desc_ids)} total={total_local} "
+                f"(layers={self.num_layers} entries={self.num_cache_entries} src_tok_cnt={src_tok_cnt})"
+            )
 
-                    # 构建并投递 READ（不携带 payload）
-                    h = self.nixl_wrapper.make_prepped_xfer(
-                        "READ",
-                        local_hdl, loc_idx,
-                        remote_hdl, rmt_idx,
-                        b""
-                    )
-                    self.nixl_wrapper.transfer(h)
-                    inflight.append(h)
-                    chunks += 1
+        # 真正发 READ
+        h = self.nixl_wrapper.make_prepped_xfer(
+            "READ",
+            src_hdl, local_desc_ids,
+            dst_hdl, remote_desc_ids,
+            b""
+        )
+        self.nixl_wrapper.transfer(h)
 
-                    # 滑窗限流
-                    if len(inflight) >= MAX_INFLIGHT:
-                        t0 = time.perf_counter_ns()
-                        self._wait_many(inflight)
-                        xfer_wait_ns += (time.perf_counter_ns() - t0)
-                        inflight.clear()
-
-                    off = hi
-
-        # 等最后一批
-        if inflight:
-            t0 = time.perf_counter_ns()
-            self._wait_many(inflight)
-            xfer_wait_ns += (time.perf_counter_ns() - t0)
-            inflight.clear()
-
-        t_all1 = time.perf_counter_ns()
-
-        # 打点日志（对齐你现有的 TIMING 样式）
-        timing = {
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.xfer_wait_ns.ns": xfer_wait_ns,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.xfer_wait_ns.ms": xfer_wait_ns / 1e6,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.xfer_wait_ns.avg_ms": xfer_wait_ns / 1e6,  # 单次
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.xfer_wait_ns.calls": 1,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.ns": (t_all1 - t_all0),
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.ms": (t_all1 - t_all0) / 1e6,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.avg_ms": (t_all1 - t_all0) / 1e6,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.calls": 1,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.chunks": chunks,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.iov_per_req_max": MAX_IOV,
-            f"nixl.{self.engine_id}.r{self.rank}.read_down.inflight_max": MAX_INFLIGHT,
-        }
-        logger.info("[TIMING][READ-DOWN] %s", timing)
+        # 轻量等待
+        while True:
+            st = self.nixl_wrapper.check_xfer_state(h)
+            if st == "DONE":
+                break
+            if st != "PROC":
+                raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
+            time.sleep(0.001)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
         per_entry = self.num_blocks * self.block_size  # 每个 entry 的“单位”数：block×token
