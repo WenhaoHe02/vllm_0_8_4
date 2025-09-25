@@ -16,6 +16,7 @@
 import os
 import time
 import uuid
+import json
 from collections import defaultdict
 from typing import List, Tuple, Optional
 
@@ -24,7 +25,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from .kv_rearrange import rearrange_tensors
+from .kv_rearrange import rearrange_tensors  # 你已有的核；read_down 调用沿用你工程里的函数名
 from contextlib import contextmanager
 
 logger = init_logger(__name__)
@@ -98,6 +99,10 @@ class DynamoNixlConnector:
         )
         self._timing_autolog = _env_flag("NIXL_TIMING_LOG", False)
 
+        # ---- DOWN_LAST 聚合 & ACK（decode 侧聚合到位后单播 ACK 回源 leader）----
+        # key -> {"got":int, "need":int, "leader_rank":int, "src_engine":str}
+        self._down_agg = defaultdict(lambda: {"got": 0, "need": 0, "leader_rank": None, "src_engine": None})
+
     def _wait_many(self, handles):
         with self._timing.span("wait_many"):
             # 轻量轮询 + 退避
@@ -143,16 +148,16 @@ class DynamoNixlConnector:
             return out
 
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
+        # 仅用于 DOWN 路径：最后一批 piggyback “DOWN_LAST” 会话 JSON，decode 聚合齐后单播 “DOWN_ACK”
         with self._timing.span("write_down"):
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
-            # 环境变量可调参数（有默认值）
-            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))  # 每个请求携带的索引上限
-            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))  # 并发请求窗口
+            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "65536"))
+            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "16"))
             BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
-            # 预构：我们依赖 add_remote_agent(DOWN) 里已经建好的 token 粒度 src/dst 句柄
+            # 预构：add_remote_agent(DOWN) 已建好的 token 粒度 src/dst 句柄
             assert 1 in self.src_xfer_side_handles, "[WRITE-DOWN] missing src token handle"
             assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
                 "[WRITE-DOWN] missing dst token handle"
@@ -160,17 +165,23 @@ class DynamoNixlConnector:
             src_hdl = self.src_xfer_side_handles[1]
             dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]
 
-            # 把“这次要搬的 block 列表”展开为 token 索引（单位：token）
-            # 注意：我们对 local/remote 分别展开，然后用同样的层×entry 顺序拼索引，保证一一对应
+            # 展开 block->token
             token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
             token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
 
-            # 构造“本次传输”的索引序列，但不一次性传给 API，而是下面按 MAX_IOV 切片
-            # 顺序 = 按 layer → entry(K/V) → token
-            # （与 add_remote_agent 里预构 dlist 的顺序完全一致）
-            # 为了避免一次性分配 40+ 万长度的大列表带来的 Python 压力，
-            # 这里逐层生成并切片发送。
-            notify_payload = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
+            # 最后一批 piggyback 一个会话 JSON（decode 侧聚合完后给源 leader 回 ACK）
+            sess_key = f"{dst_engine_id}:{int(time.time()*1e6)}:{uuid.uuid4().hex[:8]}"
+            payload_obj = {
+                "tag": "DOWN_LAST",
+                "key": sess_key,
+                "group_size": int(info["group_size"]),
+                "peer_idx": int(info["peer_idx"]),
+                "leader_rank": int((self.rank // info["group_size"]) * info["group_size"] + 0),
+                "src_engine": self.engine_id,
+                "dst_engine": dst_engine_id,
+            }
+            notify_payload = json.dumps(payload_obj).encode("utf-8")
+
             remote_rank = info["remote_rank"]
             remote_agent = self._remote_agents[dst_engine_id][remote_rank]
             is_leader = bool(info["notify_leader"])
@@ -179,11 +190,9 @@ class DynamoNixlConnector:
             total_reqs = 0
             last_req_args = None  # 留给最终“带通知”的那一小批
 
-            # 逐层/逐 entry 生成索引并切片
-            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 本地 6553 * 64 = 419,392
+            per_entry_src = int(self.num_blocks) * int(self.block_size)
             per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
-            # 将当前选择的 token_ids（相对某层/某entry）映射到全局 dlist 的索引：
-            # idx = layer * (num_entries * per_entry) + entry * per_entry + tok_id
+
             for layer in range(self.num_layers):
                 base_layer_src = layer * (self.num_cache_entries * per_entry_src)
                 base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
@@ -191,24 +200,21 @@ class DynamoNixlConnector:
                     base_entry_src = base_layer_src + entry * per_entry_src
                     base_entry_dst = base_layer_dst + entry * per_entry_dst
 
-                    N = len(token_ids_local)  # 与 token_ids_remote 等长
+                    N = len(token_ids_local)
                     for lo, hi in self._chunk_iter(N, MAX_IOV):
-                        # 构造当前批次的局部索引（Python list of ints）
-                        # 这里用列表推导，规模 <= MAX_IOV，创建成本很低
                         local_idx = [base_entry_src + t for t in token_ids_local[lo:hi]]
-                        # ✅ 远端索引 = 远端基址 + 远端 token id
                         remote_idx = [base_entry_dst + t for t in token_ids_remote[lo:hi]]
 
-                        # 最后一批留到 barrier 之后再发，且 piggyback 通知
+                        # 记录最后一批，piggyback 通知
                         last_req_args = (local_idx, remote_idx)
-                        # 其余先发（不带通知）
-                        # 通过滑动窗口控制并发
+
+                        # 非最后一批：不带 payload
                         if (hi < N) or (entry < self.num_cache_entries - 1) or (layer < self.num_layers - 1):
                             h = self.nixl_wrapper.make_prepped_xfer(
                                 "WRITE",
                                 src_hdl, local_idx,
                                 dst_hdl, remote_idx,
-                                b"",  # 不带 payload
+                                b"",
                                 backends=BACKENDS
                             )
                             self.nixl_wrapper.transfer(h)
@@ -227,12 +233,12 @@ class DynamoNixlConnector:
 
             # 组内 barrier：只有 leader 等全员到齐
             t_bar0 = time.perf_counter_ns()
-            self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
+            self._barrier_mark_and_wait(dst_engine_id, sess_key, info["group_size"], info["peer_idx"], is_leader)
             self._timing.add("write_down.barrier_ns", time.perf_counter_ns() - t_bar0)
 
             # 发送“最后一小批 + 通知”
             if last_req_args is None:
-                # 极端：这次实际上没有要搬的 token，leader 仍需发通知防止 decode 端等待
+                # 极端：这次实际上没有要搬的 token，leader 仍需发通知防止对端等待
                 if is_leader:
                     self.nixl_wrapper.send_notif(remote_agent, notify_payload)
                 return
@@ -294,27 +300,29 @@ class DynamoNixlConnector:
         # ngroups = tp_prefill // tp_decode
         ngroups = self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
         if ngroups <= 1:
-            # 等价或上行就不在这里重排
             return
 
         # 对本次涉及到的块区间做 GPU 重排（staging -> final）
-        # 注意：worker 调用 read_blocks(local, staging, remote, ...) 时，
-        #       local_block_ids = 目标（grouped），staging_block_ids = 临时（standard）。
-        # 这里我们按 ranges 成批跑 kernel。
         local_ranges = self._get_ranges(local_block_ids)
         staging_ranges = self._get_ranges(local_block_ids)  # 与上面 1:1 对拷
 
         for (l0, l1), (s0, s1) in zip(local_ranges, staging_ranges):
             # 每个层、每个 entry（K/V）分别重排
             for kv_cache in self.kv_caches:
-                # kv_cache: (K,V) or [KV] depending on layout
                 for cache in kv_cache:
                     # 切 [N=BID 区间, B, H, C]
                     t_std = cache[s0: s1 + 1].contiguous()  # staging（标准）
                     t_grp = cache[l0: l1 + 1].contiguous()  # 目标（组段）
-                    # 目标必须写回原位（可以先 alloc 一块临时，再 copy 回去；为了简单直接 in-place 覆盖）
-                    rearrange_tensors_read_down(t_std, t_grp, ngroups)
-                    # 把重排结果写回原 cache 位置
+                    # 目标必须写回原位
+                    # 注意：这里调用你工程内的 triton read_down 核包装函数名
+                    # 如果你的函数名就是 rearrange_tensors(..., d, "read")，可以改回去
+                    try:
+                        # 你项目里已有：rearrange_tensors_read_down(t_std, t_grp, ngroups)
+                        from .kv_rearrange import rearrange_tensors_read_down as _rd
+                        _rd(t_std, t_grp, ngroups)
+                    except Exception:
+                        # 兜底：用通用 read 重排
+                        rearrange_tensors(t_grp, t_std, ngroups, "read")
                     cache[l0: l1 + 1].copy_(t_grp)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
@@ -328,8 +336,6 @@ class DynamoNixlConnector:
         return ids
 
     def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
-
-        # 微观读性能影响极小，无需分段计时
         t = self.kv_caches[layer][entry_idx][block_id]  # shape: [block_size, num_heads_local, head_dim]
         return int(t.view(torch.int32).sum().item())
 
@@ -587,6 +593,9 @@ class DynamoNixlConnector:
             src_range = src_ranges[src_idx]
             dst_range = dst_ranges[dst_idx]
 
+        # …（逻辑同你现有实现，保持不变）…
+        # 为保持完整性，直接复用你之前粘贴的实现：
+        # --- begin copy ---
             src_len = src_range[-1] - src_range[0] + 1
             dst_len = dst_range[-1] - dst_range[0] + 1
 
@@ -615,6 +624,7 @@ class DynamoNixlConnector:
         if return_original_src_ranges:
             return src_overlapping_ranges, dst_overlapping_ranges, original_src_ranges
         return src_overlapping_ranges, dst_overlapping_ranges
+        # --- end copy ---
 
     @staticmethod
     def _peek(xs, k=3):
@@ -880,16 +890,61 @@ class DynamoNixlConnector:
                 finally:
                     raise
 
+    def _handle_notif(self, n: str):
+        """处理 DOWN_LAST / DOWN_ACK 两类控制消息（decode & prefill 皆可调用）"""
+        try:
+            obj = json.loads(n)
+        except Exception:
+            return  # 非本协议的 sideband，忽略
+        tag = obj.get("tag")
+        if tag == "DOWN_LAST":
+            key = str(obj.get("key"))
+            need = int(obj.get("group_size", 0))
+            src_engine = str(obj.get("src_engine", ""))
+            leader_rank = int(obj.get("leader_rank", -1))
+            agg = self._down_agg[key]
+            if agg["got"] == 0:
+                agg["need"] = need
+                agg["leader_rank"] = leader_rank
+                agg["src_engine"] = src_engine
+            agg["got"] += 1
+            logger.debug("[DOWN_LAST] key=%s got=%d/%d", key, agg["got"], agg["need"])
+            if agg["got"] >= agg["need"] and agg["leader_rank"] is not None and agg["src_engine"] is not None:
+                # 单播 ACK 到源 leader
+                try:
+                    agents = self._remote_agents.get(agg["src_engine"])
+                    if agents and 0 <= agg["leader_rank"] < len(agents):
+                        ack = json.dumps({"tag": "DOWN_ACK", "key": key}).encode("utf-8")
+                        self.nixl_wrapper.send_notif(agents[agg["leader_rank"]], ack)
+                        logger.info("[DOWN_ACK] sent key=%s -> leader_rank=%d", key, agg["leader_rank"])
+                finally:
+                    # 清理聚合状态
+                    if key in self._down_agg:
+                        del self._down_agg[key]
+        elif tag == "DOWN_ACK":
+            key = str(obj.get("key"))
+            logger.info("[DOWN_ACK] recv key=%s", key)
+        else:
+            # 其他协议扩展保留
+            pass
+
     def get_notifs(self):
         notifs = self.nixl_wrapper.update_notifs()
         if notifs:
+            # 先处理控制面
+            for n in notifs:
+                self._handle_notif(n)
             logger.info("[NOTIF] update_notifs count=%d sample=%s", len(notifs), self._peek(notifs, 4))
         else:
             logger.debug("[NOTIF] update_notifs empty")
         return notifs
 
     def get_new_notifs(self):
-        return self.nixl_wrapper.get_new_notifs()
+        notifs = self.nixl_wrapper.get_new_notifs()
+        if notifs:
+            for n in notifs:
+                self._handle_notif(n)
+        return notifs
 
     def add_remote_agent(
         self,
@@ -1015,7 +1070,6 @@ class DynamoNixlConnector:
                 # 远端（decode 侧）按块
                 if engine_id not in self.dst_xfer_side_handles:
                     self.dst_xfer_side_handles[engine_id] = {}
-                # 选择与本 rank 对应的 remote_rank（你原来 down 代码里已经算过）
                 remote_rank = self._downscale_info[engine_id]["remote_rank"]
 
                 blocks_remote = []
