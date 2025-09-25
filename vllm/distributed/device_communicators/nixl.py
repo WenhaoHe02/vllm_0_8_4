@@ -251,91 +251,71 @@ class DynamoNixlConnector:
             self._timing.add("write_down.last_send_ns", time.perf_counter_ns() - t_send_last0)
             logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
 
-    def _read_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id):
-        info = self._downscale_info[dst_engine_id]
-        assert info is not None, "[READ-DOWN] downscale info missing"
+    def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
+        down = self._downscale_info[dst_engine_id]
+        assert down is not None, "[READ-DOWN] downscale info missing"
 
-        B = int(self.block_size)
-        # —— 这些是“本次要搬”的 token 索引（注意：这里的 remote_* 必须是远端的 token 空间）
-        remote_token_ids = self._expand_blocks_to_tokens(remote_block_ids)
-        local_token_ids = self._expand_blocks_to_tokens(local_block_ids)  # 落到本地 staging 的 token 片
+        # 句柄（块粒度）
+        dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地（prefill）作为 READ 目的地
+        src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端（decode）作为 READ 来源
 
-        # 取到预构的 token 粒度句柄
-        src_hdl = self.src_xfer_side_handles[1]  # 本地（staging）token句柄
-        dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]  # 远端（decode）token句柄
-
-        # ===== 显式用“远端 token 步长”构造远端索引 =====
-        # 远端每层每entry的 token 数（= 远端 num_blocks * B）
-        dst_tok_cnt = int(self.dst_num_blocks[dst_engine_id])
-        # 本地每层每entry的 token 数（= 本地 num_blocks * B）
-        src_tok_cnt = int(self.num_blocks) * B
-
-        # 快速边界检查：token_id 都必须 < 对应 tok_cnt
-        assert remote_token_ids and local_token_ids, "[READ-DOWN] empty token list"
-        assert max(remote_token_ids) < dst_tok_cnt, \
-            f"[READ-DOWN] remote token id OOB: max={max(remote_token_ids)} dst_tok_cnt={dst_tok_cnt}"
-        assert max(local_token_ids) < src_tok_cnt, \
-            f"[READ-DOWN] local token id OOB: max={max(local_token_ids)} src_tok_cnt={src_tok_cnt}"
-
-        # 远端/本地的“跨层跨entry”的全局索引构造器
-        def _mk_remote_indices(tok_list):
-            # 索引 = layer * (entries * dst_tok_cnt) + entry * dst_tok_cnt + tok
-            out = []
-            layer_stride = self.num_cache_entries * dst_tok_cnt
+        # 用“块”为单位生成 dlist 索引（顺序：按 layer→entry→block）
+        def _ids_blockwise(num_blocks_total, block_ids):
+            ids = []
             for layer in range(self.num_layers):
-                base_layer = layer * layer_stride
-                for entry in range(self.num_cache_entries):  # 0:K, 1:V
-                    base_entry = base_layer + entry * dst_tok_cnt
-                    out.extend(base_entry + t for t in tok_list)
-            return out
+                for entry in range(self.num_cache_entries):  # K、V
+                    for b in block_ids:
+                        ids.append(layer * self.num_cache_entries * num_blocks_total
+                                   + entry * num_blocks_total + b)
+            return ids
 
-        def _mk_local_indices(tok_list):
-            # 本地 staging 句柄同样是 token 粒度，但步长是“本地”的
-            out = []
-            layer_stride = self.num_cache_entries * src_tok_cnt
-            for layer in range(self.num_layers):
-                base_layer = layer * layer_stride
-                for entry in range(self.num_cache_entries):
-                    base_entry = base_layer + entry * src_tok_cnt
-                    out.extend(base_entry + t for t in tok_list)
-            return out
+        num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]
+        src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)  # 远端块索引
+        dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)  # 本地 staging 块索引（标准布局）
 
-        remote_desc_ids = _mk_remote_indices(remote_token_ids)
-        local_desc_ids = _mk_local_indices(local_token_ids)
-
-        # 再做一次总长度越界保护，能把问题一次性打全
-        total_remote = self.num_layers * self.num_cache_entries * dst_tok_cnt
-        total_local = self.num_layers * self.num_cache_entries * src_tok_cnt
-        if remote_desc_ids and (remote_desc_ids[-1] >= total_remote or min(remote_desc_ids) < 0):
-            raise RuntimeError(
-                "[READ-DOWN] remote indices OOB: "
-                f"min={min(remote_desc_ids)} max={max(remote_desc_ids)} total={total_remote} "
-                f"(layers={self.num_layers} entries={self.num_cache_entries} dst_tok_cnt={dst_tok_cnt})"
-            )
-        if local_desc_ids and (local_desc_ids[-1] >= total_local or min(local_desc_ids) < 0):
-            raise RuntimeError(
-                "[READ-DOWN] local indices OOB: "
-                f"min={min(local_desc_ids)} max={max(local_desc_ids)} total={total_local} "
-                f"(layers={self.num_layers} entries={self.num_cache_entries} src_tok_cnt={src_tok_cnt})"
-            )
-
-        # 真正发 READ
+        # 传输（READ）
         h = self.nixl_wrapper.make_prepped_xfer(
             "READ",
-            src_hdl, local_desc_ids,
-            dst_hdl, remote_desc_ids,
+            dst_handle, dst_desc_ids,
+            src_handle, src_desc_ids,
             b""
         )
         self.nixl_wrapper.transfer(h)
-
-        # 轻量等待
         while True:
             st = self.nixl_wrapper.check_xfer_state(h)
             if st == "DONE":
                 break
             if st != "PROC":
                 raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
+            # 轻量轮询
             time.sleep(0.001)
+
+        # ===== 传完在本机做重排：standard -> grouped =====
+        # ngroups = tp_prefill // tp_decode
+        ngroups = self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
+        if ngroups <= 1:
+            # 等价或上行就不在这里重排
+            return
+
+        # 对本次涉及到的块区间做 GPU 重排（staging -> final）
+        # 注意：worker 调用 read_blocks(local, staging, remote, ...) 时，
+        #       local_block_ids = 目标（grouped），staging_block_ids = 临时（standard）。
+        # 这里我们按 ranges 成批跑 kernel。
+        local_ranges = self._get_ranges(local_block_ids)
+        staging_ranges = self._get_ranges(local_block_ids)  # 与上面 1:1 对拷
+
+        for (l0, l1), (s0, s1) in zip(local_ranges, staging_ranges):
+            # 每个层、每个 entry（K/V）分别重排
+            for kv_cache in self.kv_caches:
+                # kv_cache: (K,V) or [KV] depending on layout
+                for cache in kv_cache:
+                    # 切 [N=BID 区间, B, H, C]
+                    t_std = cache[s0: s1 + 1].contiguous()  # staging（标准）
+                    t_grp = cache[l0: l1 + 1].contiguous()  # 目标（组段）
+                    # 目标必须写回原位（可以先 alloc 一块临时，再 copy 回去；为了简单直接 in-place 覆盖）
+                    rearrange_tensors_read_down(t_std, t_grp, ngroups)
+                    # 把重排结果写回原 cache 位置
+                    cache[l0: l1 + 1].copy_(t_grp)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
         per_entry = self.num_blocks * self.block_size  # 每个 entry 的“单位”数：block×token
@@ -665,7 +645,7 @@ class DynamoNixlConnector:
             downscale_info = self._downscale_info.get(dst_engine_id)
             tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
             if downscale_info is not None:
-                self._read_blocks_down(local_block_ids, remote_block_ids, dst_engine_id)
+                self._read_blocks_down(local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id)
                 # 自动或手动打印计时
                 if self._timing_autolog:
                     stats = self.get_timing(reset=True)
@@ -1019,6 +999,54 @@ class DynamoNixlConnector:
                 except Exception as e:
                     logger.debug("make_connection(%s) lazy: %s", self._remote_agents[engine_id][remote_rank], e)
 
+                if "read_down_src" not in self.src_xfer_side_handles:
+                    blocks_local = []
+                    local_dev_id = int(torch.cuda.current_device())
+                    # 本地（prefill 侧）标准布局的每个 block 的 (base, len, dev)
+                    for layer in range(self.num_layers):
+                        # K、V 两个 entry
+                        for base in self.kv_caches_base_addr[self.engine_id][layer]:
+                            for bid in range(self.num_blocks):
+                                block_offset = bid * self.block_len
+                                blocks_local.append((base + block_offset, self.block_len, local_dev_id))
+                    descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
+                    self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
+
+                # 远端（decode 侧）按块
+                if engine_id not in self.dst_xfer_side_handles:
+                    self.dst_xfer_side_handles[engine_id] = {}
+                # 选择与本 rank 对应的 remote_rank（你原来 down 代码里已经算过）
+                remote_rank = self._downscale_info[engine_id]["remote_rank"]
+
+                blocks_remote = []
+                remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
+                for layer in range(self.num_layers):
+                    layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [K_base, V_base]
+                    layer_dev_ids = None
+                    if remote_dev_table is not None:
+                        layer_dev_ids = remote_dev_table[remote_rank][layer]
+                    for entry_idx, rbase in enumerate(layer_bases):
+                        rdev = int(layer_dev_ids[entry_idx]) if layer_dev_ids is not None else int(remote_rank)
+                        for bid in range(num_blocks):
+                            block_offset = bid * self.block_len
+                            blocks_remote.append((rbase + block_offset, self.block_len, rdev))
+
+                descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
+                # 专用 key 存起来（与 token 路径区分开）
+                self.dst_xfer_side_handles[engine_id]["read_down_dst"] = self.nixl_wrapper.prep_xfer_dlist(
+                    self._remote_agents[engine_id][remote_rank], descs_remote
+                )
+
+                # 单独记录“read_down 的 num_blocks = 按块数”
+                if not hasattr(self, "dst_num_blocks_read"):
+                    self.dst_num_blocks_read = {}
+                self.dst_num_blocks_read[engine_id] = num_blocks
+
+                # 提前拨号一次（懒连接容错）
+                try:
+                    self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
+                except Exception as e:
+                    logger.debug("[ADD][READ-DOWN] make_connection lazy: %s", e)
                 self._tp_size[engine_id] = self._tp_size[self.engine_id]
 
                 logger.info("[ADD] downscale prepared: src_keys=%s dst_keys=%s dst_units(token)=%s",
@@ -1076,7 +1104,7 @@ class DynamoNixlConnector:
 
     _last_done_log_ts = 0.0
 
-    def get_done_tranfers(self) -> List[str]:
+    def get_done_transfers(self) -> List[str]:
         with self._timing.span("get_done_transfers"):
             done_req_ids: List[str] = []
             for req_id, handles in list(self._transfers.items()):

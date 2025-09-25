@@ -254,3 +254,100 @@ def rearrange_tensors_down(
         )
     else:
         raise ValueError("direction must be 'write' or 'read'")
+
+# rearrange_read_down.py
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _rearrange_kernel_read_down(
+    t_std_ptr, t_grp_ptr,  # src: standard (N,B,H,C) -> dst: grouped (N,B,H,C)
+    N, B, H, C,
+    ngroups,               # ngroups = tp_prefill // tp_decode
+    tensor_subset_size,    # = N * B * (H//ngroups) * C
+    elems_per_block,       # = B * H * C
+    elems_per_token,       # = H * C
+    BLOCK_SIZE: tl.constexpr
+):
+    pid  = tl.program_id(0)
+    base = pid * BLOCK_SIZE
+    off  = base + tl.arange(0, BLOCK_SIZE)
+
+    total = N * elems_per_block
+    mask  = off < total
+
+    n = off // elems_per_block
+    b = (off // elems_per_token) % B
+    h = (off // C) % H
+    c = off % C
+
+    Hper = H // ngroups
+    g    = (h * ngroups) // H        # 0..ngroups-1
+    hin  = h % Hper                  # 0..Hper-1
+
+    off_in_seg = n * (B * Hper * C) + b * (Hper * C) + hin * C + c
+    pos_grp    = g * tensor_subset_size + off_in_seg
+
+    val = tl.load(t_std_ptr + off, mask=mask, other=0)
+    tl.store(t_grp_ptr + pos_grp, val, mask=mask)
+
+@triton.jit
+def _rearrange_kernel_read_down(
+    t_std_ptr, t_grp_ptr,  # src: standard (N,B,H,C) -> dst: grouped (N,B,H,C)
+    N, B, H, C,
+    ngroups,               # ngroups = tp_prefill // tp_decode
+    tensor_subset_size,    # = N * B * (H//ngroups) * C
+    elems_per_block,       # = B * H * C
+    elems_per_token,       # = H * C
+    BLOCK_SIZE: tl.constexpr
+):
+    pid  = tl.program_id(0)
+    base = pid * BLOCK_SIZE
+    off  = base + tl.arange(0, BLOCK_SIZE)
+
+    total = N * elems_per_block
+    mask  = off < total
+
+    n = off // elems_per_block
+    b = (off // elems_per_token) % B
+    h = (off // C) % H
+    c = off % C
+
+    Hper = H // ngroups
+    g    = (h * ngroups) // H        # 0..ngroups-1
+    hin  = h % Hper                  # 0..Hper-1
+
+    # 在 grouped（按组拼接）中的线性位置
+    off_in_seg = n * (B * Hper * C) + b * (Hper * C) + hin * C + c
+    pos_grp    = g * tensor_subset_size + off_in_seg
+
+    val = tl.load(t_std_ptr + off, mask=mask, other=0)
+    tl.store(t_grp_ptr + pos_grp, val, mask=mask)
+
+def rearrange_tensors_read_down(
+    t_standard: torch.Tensor,
+    t_grouped:  torch.Tensor,
+    ngroups: int,
+    block_size_elements: int = 1024,
+):
+    assert t_standard.shape == t_grouped.shape and t_standard.ndim == 4
+    assert t_standard.is_contiguous() and t_grouped.is_contiguous()
+    N, B, H, C = t_standard.shape
+    assert ngroups > 0 and (H % ngroups == 0)
+
+    elems_per_block  = B * H * C
+    elems_per_token  = H * C
+    tensor_subset_sz = N * B * (H // ngroups) * C
+    total = N * elems_per_block
+    grid = ((total + block_size_elements - 1) // block_size_elements,)
+
+    _rearrange_kernel_read_down[grid](
+        t_standard, t_grouped,
+        N, B, H, C,
+        ngroups,
+        tensor_subset_sz,
+        elems_per_block,
+        elems_per_token,
+        BLOCK_SIZE=block_size_elements,
+    )
