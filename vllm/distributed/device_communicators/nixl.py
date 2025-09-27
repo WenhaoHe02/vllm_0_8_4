@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,6 +16,8 @@
 import os
 import time
 import uuid
+import threading
+import atexit
 from collections import defaultdict
 from typing import List, Tuple, Optional
 
@@ -24,7 +26,15 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from .kv_rearrange import rearrange_tensors  # 你已有的 read/write 重排 kernel 入口
+# --- kv 重排 ---
+from .kv_rearrange import rearrange_tensors
+try:
+    # 你之前的实现里叫 rearrange_tensors_read_down
+    from .kv_rearrange import rearrange_tensors_read_down
+except Exception:
+    # 兼容如果只导出了 rearrange_tensors_down(direction="read")
+    from .kv_rearrange import rearrange_tensors_down as rearrange_tensors_read_down
+
 from contextlib import contextmanager
 
 logger = init_logger(__name__)
@@ -38,8 +48,7 @@ except ImportError:
     NixlWrapper = None
 
 
-# ===================== 常量与小工具 =====================
-
+# ----------------- 通知格式 & 工具 -----------------
 DOWN_PREFIX = "DOWN:"
 DOWN_ACK_PREFIX = "DOWN-ACK:"
 
@@ -56,36 +65,33 @@ def _as_str(b: object) -> str:
             return repr(b)
     return str(b)
 
-def _mk_down_key(notify_key: str) -> str:
-    # 传输侧信号：DOWN:<key>
-    return f"{DOWN_PREFIX}{notify_key}"
+def _mk_down_key(key: str) -> str:
+    # 统一在下行写入时加 "DOWN:<key>" 前缀
+    return f"{DOWN_PREFIX}{key}"
 
-def _mk_ack_key(notify_key: str) -> str:
-    # ACK 侧信号：DOWN-ACK:<key>
-    return f"{DOWN_ACK_PREFIX}{notify_key}"
+def _mk_ack_key(key: str) -> str:
+    # 远端收到 DOWN:<key> 后，回 DOWN-ACK:<key>
+    return f"{DOWN_ACK_PREFIX}{key}"
 
 def _notif_payload_of(n) -> Optional[str]:
-    """
-    兼容多种返回形态，把 update_notifs() 返回项解析成 str payload。
-    """
-    if n is None:
+    # 后端可能返回复杂对象；通常是 bytes/str
+    try:
+        s = _as_str(n)
+        return s
+    except Exception:
         return None
-    if isinstance(n, (bytes, bytearray, str)):
-        return _as_str(n)
-    # dict-like
-    if hasattr(n, "get"):
-        p = n.get("payload") or n.get("data") or n.get("msg") or n.get("message")
-        if p is not None:
-            return _as_str(p)
-        # 某些实现可能直接把字符串放在 "notif" 字段
-        p = n.get("notif") or n.get("notification")
-        return _as_str(p) if p is not None else None
-    # object-like
-    for attr in ("payload", "data", "msg", "message", "notif", "notification"):
-        if hasattr(n, attr):
-            return _as_str(getattr(n, attr))
-    # 最后兜底
-    return _as_str(n)
+
+def _parse_down_payload(payload: str) -> Tuple[str, Optional[str]]:
+    # 形如： "DOWN:<uuid>|src=<engine_id>" 或 "DOWN:<uuid>"
+    if not payload.startswith(DOWN_PREFIX):
+        return "", None
+    body = payload[len(DOWN_PREFIX):]
+    src_engine = None
+    if "|src=" in body:
+        key, rest = body.split("|src=", 1)
+        src_engine = rest.strip() or None
+        return key.strip(), src_engine
+    return body.strip(), None
 
 
 class NixlMetadata(
@@ -131,7 +137,7 @@ class DynamoNixlConnector:
 
         self.kv_caches_dev_ids = {}
 
-        self._transfers = defaultdict(list)  # notify_key(str) -> [handles]
+        self._transfers = defaultdict(list)
 
         self._tp_size[engine_id] = vllm_config.parallel_config.tensor_parallel_size
         self._is_mla = "deepseek" in vllm_config.model_config.architectures[0].lower()
@@ -148,8 +154,56 @@ class DynamoNixlConnector:
         )
         self._timing_autolog = _env_flag("NIXL_TIMING_LOG", False)
 
-    # ------------- 小工具 -------------
+        # ---- 通知泵配置 ----
+        self._notif_stop = threading.Event()
+        self._notif_thread: Optional[threading.Thread] = None
+        self._notif_pump_interval = float(os.getenv("NIXL_NOTIF_PUMP_INTERVAL", "0.001"))
+        self._ack_timeout_default = float(os.getenv("NIXL_DOWN_ACK_TIMEOUT", "5.0"))
 
+        if _env_flag("NIXL_NOTIF_PUMP", True):
+            self._notif_thread = threading.Thread(
+                target=self._notif_pump_loop,
+                name=f"nixl-notif-pump-{engine_id}-r{rank}",
+                daemon=True,
+            )
+            self._notif_thread.start()
+            logger.info("[NOTIF-PUMP] started (engine=%s rank=%s)", engine_id, rank)
+            atexit.register(self._notif_pump_stop)
+
+    # ============== 通知泵：持续轮询并即时 ACK 下行 ==============
+    def _notif_pump_loop(self):
+        try:
+            while not self._notif_stop.is_set():
+                try:
+                    notifs = self.nixl_wrapper.get_new_notifs()
+                except Exception:
+                    notifs = None
+                if notifs:
+                    for n in notifs:
+                        payload = _notif_payload_of(n)
+                        if not payload:
+                            continue
+                        if payload.startswith(DOWN_PREFIX):
+                            key, src_engine = _parse_down_payload(payload)
+                            self._send_ack_best_effort(key, src_engine_id=src_engine)
+                            logger.info("[NOTIF-PUMP] DOWN recv -> ACK key=%s src=%s", key, src_engine or "?")
+                        elif payload.startswith(DOWN_ACK_PREFIX):
+                            # 只做观测日志
+                            logger.info("[NOTIF-PUMP] ACK observed payload=%s", payload)
+                self._notif_stop.wait(self._notif_pump_interval)
+        except Exception as e:
+            logger.warning("[NOTIF-PUMP] loop crashed: %s", e)
+
+    def _notif_pump_stop(self):
+        try:
+            self._notif_stop.set()
+            if self._notif_thread and self._notif_thread.is_alive():
+                self._notif_thread.join(timeout=0.5)
+                logger.info("[NOTIF-PUMP] stopped")
+        except Exception:
+            pass
+
+    # ============== 基本工具 ==============
     def _wait_many(self, handles):
         with self._timing.span("wait_many"):
             # 轻量轮询 + 退避
@@ -194,78 +248,19 @@ class DynamoNixlConnector:
                 out.extend(range(base, base + B))
             return out
 
-    # ============= DOWN：prefill->decode，最后一批 piggyback + ACK 等待 =============
-
-    def _wait_for_ack(self, key: str, timeout_s: float, remote_engine: str) -> bool:
-        """
-        轮询 notifs，等到 DOWN-ACK:<key>。为避免吞掉别的通知，这里只做匹配与短暂 sleep。
-        """
-        wait_key = _mk_ack_key(key)
-        t0 = time.perf_counter()
-        while True:
-            notifs = self.nixl_wrapper.get_new_notifs()
-            if notifs:
-                for n in notifs:
-                    payload = _notif_payload_of(n)
-                    if payload == wait_key:
-                        dt = (time.perf_counter() - t0) * 1000.0
-                        logger.info("[DOWN_ACK] recv key=%s from=%s wait_ms=%.3f", key, remote_engine, dt)
-                        return True
-            if (time.perf_counter() - t0) >= timeout_s:
-                logger.warning("[DOWN_ACK] timeout key=%s after %.3fs (engine=%s)", key, timeout_s, remote_engine)
-                return False
-            time.sleep(0.0005)
-
-    def _send_ack_best_effort(self, key: str, src_engine_id: Optional[str] = None):
-        """
-        收到 DOWN:<key> 后，尽力单播回 ACK（如果能定位到 src_engine_id，
-        则只发给该 engine 的所有已连 peer；否则退化为对所有 engine 的所有 peer 各发一次）。
-        """
-        ack = _as_bytes(_mk_ack_key(key))
-        targets = []
-        if src_engine_id and (src_engine_id in self._remote_agents):
-            targets = self._remote_agents[src_engine_id]
-        else:
-            # 退化：给所有已知 engine 的所有 peer（仍是“单播”，只是多次单播）
-            for _, peers in self._remote_agents.items():
-                targets.extend(peers)
-        if not targets:
-            logger.warning("[DOWN_ACK] no remote agents to send ack, key=%s", key)
-            return
-        for ag in targets:
-            try:
-                self.nixl_wrapper.send_notif(ag, ack)
-            except Exception as e:
-                logger.debug("[DOWN_ACK] send to %s failed: %s", ag, e)
-        logger.info("[DOWN_ACK] sent key=%s to %d peer(s)", key, len(targets))
-
-    def _try_parse_down_payload(self, payload: str) -> Tuple[str, Optional[str]]:
-        """
-        支持两种格式：
-          1) "DOWN:<key>"
-          2) "DOWN:<key>|src=<engine_id>"   # 可选地携带来源 engine 以便精准 ACK
-        返回: (key, src_engine_id)
-        """
-        p = payload[len(DOWN_PREFIX):]
-        src = None
-        if "|src=" in p:
-            key, tag = p.split("|src=", 1)
-            src = tag.strip() or None
-            return key, src
-        return p, None
-
+    # ============== 写入（下行） ==============
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         with self._timing.span("write_down"):
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
             # 环境变量可调参数（有默认值）
-            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))   # 每个请求携带的索引上限
+            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))  # 每个请求携带的索引上限
             MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))  # 并发请求窗口
             BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
-            ACK_TIMEOUT = float(os.getenv("NIXL_DOWN_ACK_TIMEOUT", "2.0"))
+            ACK_TIMEOUT = self._ack_timeout_default
 
-            # 预构：token 粒度 src/dst 句柄（在 add_remote_agent(DOWN) 已建好）
+            # 预构：add_remote_agent(DOWN) 里已经建好的 token 粒度 src/dst 句柄
             assert 1 in self.src_xfer_side_handles, "[WRITE-DOWN] missing src token handle"
             assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
                 "[WRITE-DOWN] missing dst token handle"
@@ -273,25 +268,33 @@ class DynamoNixlConnector:
             src_hdl = self.src_xfer_side_handles[1]
             dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]
 
-            # block -> token 索引
+            # block -> token 展开
             token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
             token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
 
-            # sideband 通知载荷（最后一批 piggyback）
+            # 下行通知 key（带来源，便于远端单播回 ACK）
             raw_key = _as_str(notify_msg)
-            down_key = _mk_down_key(f"{raw_key}|src={self.engine_id}")  # 携带来源 engine，方便远端精准单播 ACK
-            notify_payload = _as_bytes(down_key)
+            down_key_full = f"{raw_key}|src={self.engine_id}"
+            down_payload = _as_bytes(_mk_down_key(down_key_full))
 
             remote_rank = info["remote_rank"]
+            remote_agent = self._remote_agents[dst_engine_id][remote_rank]
             is_leader = bool(info["notify_leader"])
+
+            # 清理历史通知，避免干扰
+            try:
+                _ = self.nixl_wrapper.update_notifs()
+            except Exception:
+                pass
 
             inflight = []
             total_reqs = 0
-            last_req_args = None  # 留给“最后一小批 + 通知”
+            last_req_args = None  # 留给最终“带通知”的那一小批
 
             per_entry_src = int(self.num_blocks) * int(self.block_size)
             per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
 
+            # 逐层/逐entry 切片发送
             for layer in range(self.num_layers):
                 base_layer_src = layer * (self.num_cache_entries * per_entry_src)
                 base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
@@ -305,12 +308,14 @@ class DynamoNixlConnector:
                         remote_idx = [base_entry_dst + t for t in token_ids_remote[lo:hi]]
 
                         last_req_args = (local_idx, remote_idx)
+
+                        # 非最后一批：不带通知
                         if (hi < N) or (entry < self.num_cache_entries - 1) or (layer < self.num_layers - 1):
                             h = self.nixl_wrapper.make_prepped_xfer(
                                 "WRITE",
                                 src_hdl, local_idx,
                                 dst_hdl, remote_idx,
-                                b"",  # 非最后一批不带 sideband
+                                b"",  # 不带 payload
                                 backends=BACKENDS
                             )
                             self.nixl_wrapper.transfer(h)
@@ -320,28 +325,25 @@ class DynamoNixlConnector:
                                 self._wait_many(inflight)
                                 inflight.clear()
 
-            # 等非最后一批全部完成
+            # 等非最后一批完成
             t_wait0 = time.perf_counter_ns()
             if inflight:
                 self._wait_many(inflight)
                 inflight.clear()
             self._timing.add("write_down.wait_bulk_ns", time.perf_counter_ns() - t_wait0)
 
-            # 组内 barrier
+            # 组内 barrier：只有 leader 等全员到齐
             t_bar0 = time.perf_counter_ns()
-            self._barrier_mark_and_wait(
-                dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader
-            )
+            self._barrier_mark_and_wait(dst_engine_id, down_key_full, info["group_size"], info["peer_idx"], is_leader)
             self._timing.add("write_down.barrier_ns", time.perf_counter_ns() - t_bar0)
 
-            # 最后一批 + piggyback 通知
+            # 最后一小批 + piggyback 通知
             if last_req_args is None:
-                # 无数据也要通知（leader）
+                # 极端：没有数据也要通知，防止 decode 端等待
                 if is_leader:
-                    agent = self._remote_agents[dst_engine_id][remote_rank]
-                    self.nixl_wrapper.send_notif(agent, notify_payload)
-                # 等 ACK（如果有的话）
-                self._wait_for_ack(raw_key, ACK_TIMEOUT, dst_engine_id)
+                    self.nixl_wrapper.send_notif(remote_agent, down_payload)
+                    # 等 ACK（即便 0 数据）
+                    self._wait_for_ack(down_key_full, from_engine_id=dst_engine_id, timeout=ACK_TIMEOUT)
                 return
 
             local_idx, remote_idx = last_req_args
@@ -349,7 +351,7 @@ class DynamoNixlConnector:
                 "WRITE",
                 src_hdl, local_idx,
                 dst_hdl, remote_idx,
-                notify_payload,  # 只在最后一批带通知
+                down_payload,  # 只在最后一批带通知
                 backends=BACKENDS
             )
             t_send_last0 = time.perf_counter_ns()
@@ -358,20 +360,19 @@ class DynamoNixlConnector:
             self._timing.add("write_down.last_send_ns", time.perf_counter_ns() - t_send_last0)
             logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
 
-            # 等远端 ACK
-            self._wait_for_ack(raw_key, ACK_TIMEOUT, dst_engine_id)
+            # 等待远端单播 ACK
+            self._wait_for_ack(down_key_full, from_engine_id=dst_engine_id, timeout=ACK_TIMEOUT)
 
-    # ============= READ-DOWN：decode->prefill 拉块 + 本地 GPU 重排 =============
-
+    # ============== 读取（下行） ==============
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         down = self._downscale_info[dst_engine_id]
         assert down is not None, "[READ-DOWN] downscale info missing"
 
         # 句柄（块粒度）
-        dst_handle = self.src_xfer_side_handles["read_down_src"]               # 本地（prefill）作为 READ 目的地
+        dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地（prefill）作为 READ 目的地
         src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端（decode）作为 READ 来源
 
-        # 构造“按 layer→entry→block”的索引
+        # 用“块”为单位生成 dlist 索引（顺序：按 layer→entry→block）
         def _ids_blockwise(num_blocks_total, block_ids):
             ids = []
             for layer in range(self.num_layers):
@@ -382,8 +383,8 @@ class DynamoNixlConnector:
             return ids
 
         num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]
-        src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)  # 远端
-        dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)  # 本地 staging
+        src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)  # 远端块索引
+        dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)   # 本地 staging 块索引（标准布局）
 
         # 传输（READ）
         h = self.nixl_wrapper.make_prepped_xfer(
@@ -402,27 +403,25 @@ class DynamoNixlConnector:
             time.sleep(0.001)
 
         # ===== 传完在本机做重排：standard -> grouped =====
+        # ngroups = tp_prefill // tp_decode
         ngroups = self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
         if ngroups <= 1:
             return
 
         local_ranges = self._get_ranges(local_block_ids)
-        staging_ranges = self._get_ranges(local_block_ids)  # 与上面 1:1
+        staging_ranges = self._get_ranges(local_block_ids)  # 1:1
 
         for (l0, l1), (s0, s1) in zip(local_ranges, staging_ranges):
             for kv_cache in self.kv_caches:
                 for cache in kv_cache:
-                    t_std = cache[s0: s1 + 1].contiguous()
-                    t_grp = cache[l0: l1 + 1].contiguous()
-                    # 你的 read_down 重排内核（standard->grouped）
-                    # 这里复用你已有的 rearrange_tensors(read方向)，确保 direction="read"
-                    rearrange_tensors(t_grp, t_std, ngroups, "read")
+                    t_std = cache[s0: s1 + 1].contiguous()  # staging（标准）
+                    t_grp = cache[l0: l1 + 1].contiguous()  # 目标（组段）
+                    rearrange_tensors_read_down(t_std, t_grp, ngroups)
                     cache[l0: l1 + 1].copy_(t_grp)
 
-    # ============= 其它通用逻辑 =============
-
+    # ============== 其它通用工具 ==============
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
-        per_entry = self.num_blocks * self.block_size
+        per_entry = self.num_blocks * self.block_size  # 每个 entry 的“单位”数：block×token
         ids = []
         for layer_id in range(self.num_layers):
             for entry_index in range(self.num_cache_entries):
@@ -432,7 +431,7 @@ class DynamoNixlConnector:
         return ids
 
     def _kv_block_u32sum(self, layer: int, entry_idx: int, block_id: int) -> int:
-        t = self.kv_caches[layer][entry_idx][block_id]  # [B, H_local, C]
+        t = self.kv_caches[layer][entry_idx][block_id]  # shape: [block_size, num_heads_local, head_dim]
         return int(t.view(torch.int32).sum().item())
 
     def _down_verify_peer_segment(
@@ -445,6 +444,7 @@ class DynamoNixlConnector:
         if scratch_block_id is None:
             scratch_block_id = (remote_block_id + 1) % max(1, self.num_blocks)
 
+        # 触发一次 token 粒度 READ（内部会展开）
         self.read_blocks(
             local_block_ids=[scratch_block_id],
             staging_block_ids=[scratch_block_id],
@@ -452,6 +452,7 @@ class DynamoNixlConnector:
             dst_engine_id=dst_engine_id,
         )
 
+        # sum32 校验（抽前 max_layers 层）
         L = min(max_layers, self.num_layers)
         k_ok = True
         v_ok = True
@@ -499,15 +500,15 @@ class DynamoNixlConnector:
                 break
         return "".join(out) or uuid4().hex[:maxlen]
 
-    def _barrier_dir(self, dst_engine_id: str, notify_key: bytes, group_size: int) -> str:
+    def _barrier_dir(self, dst_engine_id: str, notify_key: str, group_size: int) -> str:
         base = os.getenv("NIXL_BARRIER_DIR", "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp")
         safe_engine = self._sanitize_key(dst_engine_id, 16)
-        safe_key = self._sanitize_key(_as_str(notify_key), 24)
+        safe_key = self._sanitize_key(notify_key, 24)
         d = os.path.join(base, f"nixl_down_bar_{safe_engine}_{safe_key}_{group_size}")
         os.makedirs(d, exist_ok=True)
         return d
 
-    def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: bytes,
+    def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: str,
                                group_size: int, peer_idx: int, is_leader: bool) -> None:
         d = self._barrier_dir(dst_engine_id, notify_key, group_size)
         my_flag = os.path.join(d, f"{peer_idx}.ok")
@@ -537,12 +538,57 @@ class DynamoNixlConnector:
         except Exception as e:
             logger.warning("[DOWN-BAR] wait/cleanup failed: %s", e)
 
+    # ============== ACK 相关 ==============
+    def _send_ack_best_effort(self, key: str, src_engine_id: Optional[str]):
+        # 组装完整 ACK payload：DOWN-ACK:DOWN:<uuid>|src=<engine>
+        full_down_key = _mk_down_key(f"{key}|src={src_engine_id}") if src_engine_id else _mk_down_key(key)
+        payload = _as_bytes(_mk_ack_key(full_down_key))
+
+        targets = None
+        if src_engine_id and src_engine_id in self._remote_agents:
+            # 定点单播给来源 engine 的 leader（rank 0）
+            targets = [self._remote_agents[src_engine_id][0]]
+        else:
+            # 回退：若未知来源，广播给所有已知 agent（不推荐，但保证健壮性）
+            targets = [name for lst in self._remote_agents.values() for name in lst]
+
+        for t in targets:
+            try:
+                self.nixl_wrapper.send_notif(t, payload)
+                logger.info("[DOWN_ACK] send key=%s -> %s", key, t)
+                return
+            except Exception as e:
+                logger.warning("[DOWN_ACK] send failed to %s: %s", t, e)
+        logger.warning("[DOWN_ACK] no target to send (src_engine=%s)", src_engine_id)
+
+    def _wait_for_ack(self, down_key_full: str, from_engine_id: str, timeout: float) -> bool:
+        """
+        down_key_full: 形如 "<uuid>|src=<engine_id>"
+        轮询 new_notifs / update_notifs，直到观察到 DOWN-ACK:DOWN:<down_key_full>
+        """
+        deadline = time.time() + float(timeout)
+        expect = _mk_ack_key(_mk_down_key(down_key_full))
+        while time.time() < deadline:
+            for fn in (self.nixl_wrapper.get_new_notifs, self.nixl_wrapper.update_notifs):
+                try:
+                    notifs = fn()
+                except Exception:
+                    notifs = None
+                if notifs:
+                    for n in notifs:
+                        s = _notif_payload_of(n)
+                        if s == expect:
+                            logger.info("[DOWN_ACK] recv key=%s from=%s", down_key_full, from_engine_id)
+                            return True
+            time.sleep(0.002)
+        logger.warning("[DOWN_ACK] timeout key=%s after %.3fs (engine=%s)", down_key_full, timeout, from_engine_id)
+        return False
+
     @property
     def agent_name(self):
         return self.nixl_wrapper.name
 
-    # ============= KV 注册 =============
-
+    # ============== 注册KV缓存 ==============
     def register_kv_caches(self, kv_caches: List[torch.Tensor]):
         logger.debug("--------------------------------")
         logger.debug("Registering kv caches for engine %s", self.engine_id)
@@ -611,6 +657,8 @@ class DynamoNixlConnector:
     def shutdown(self):
         for descs_list in self._registered_descs:
             self.nixl_wrapper.deregister_memory(descs_list)
+        # 关闭通知泵
+        self._notif_pump_stop()
         for agent_names in self._remote_agents.values():
             for agent_name in agent_names:
                 self.nixl_wrapper.remove_remote_agent(agent_name)
@@ -623,8 +671,7 @@ class DynamoNixlConnector:
             for prefill_dst_xfer_side_handle in prefill_dst_xfer_side_handles.values():
                 self.nixl_wrapper.release_dlist_handle(prefill_dst_xfer_side_handle)
 
-    # ============= 区间/描述子辅助 =============
-
+    # ============== ranges/desc 构造 ==============
     def _get_ranges(self, block_ids: List[int]):
         ranges = []
         for i in range(len(block_ids)):
@@ -670,9 +717,9 @@ class DynamoNixlConnector:
                                 + entry_index * num_blocks + block_id
                             )
         else:
-            # 远端：按对端的 dst_num_blocks
+            # 远端：按对端的 dst_num_blocks（单位：block；若 DOWN 预处理成 token 数）
             num_blocks = self.dst_num_blocks[engine_id]
-            for layer_id in layer_ids:
+            for layer_id in range(self.num_layers):
                 for entry_index in range(self.num_cache_entries):
                     for block_id in block_ids:
                         descs_ids.append(
@@ -724,8 +771,7 @@ class DynamoNixlConnector:
     def _peek(xs, k=3):
         return xs[:k] + (["..."] if len(xs) > k else [])
 
-    # ============= 外部 API：READ/WRITE =============
-
+    # ============== 公开读/写 API ==============
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         with self._timing.span("read_blocks"):
             logger.info("[READ] local=%s staging=%s remote=%s dst_engine=%s",
@@ -843,6 +889,7 @@ class DynamoNixlConnector:
                             dst_engine_id, len(local_block_ids), len(staging_block_ids),
                             len(remote_block_ids), type(notify_msg).__name__)
 
+                # 强一致长度检查
                 assert len(staging_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
                 assert len(remote_block_ids) == len(local_block_ids), \
@@ -980,8 +1027,6 @@ class DynamoNixlConnector:
                 finally:
                     raise
 
-    # ============= 通知/完成轮询 =============
-
     def get_notifs(self):
         notifs = self.nixl_wrapper.update_notifs()
         if notifs:
@@ -1031,18 +1076,19 @@ class DynamoNixlConnector:
             logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                         tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
-            # ---------- DOWN：prefill(tp大) -> decode(tp小) ----------
+            # --------- DOWN path (decode tp < prefill tp) ----------
             if tp_multiplier == 0 and not self._is_mla:
                 group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
                 remote_rank = self.rank // group_size
                 peer_idx = self.rank % group_size
+                slot = peer_idx
 
                 B = int(self.block_size)
-                token_len_local = self.block_len // B
-                token_len_total = token_len_local * group_size
-                seg_len = token_len_local * B
-                full_len = token_len_total * B
-                peer_off_tok = peer_idx * token_len_local
+                token_len_local = self.block_len // B  # = H_local * C * bytes
+                token_len_total = token_len_local * group_size  # = H_total * C * bytes
+                seg_len = token_len_local * B  # = B * H_local * C * bytes
+                full_len = token_len_total * B  # = B * H_total * C * bytes
+                peer_off_tok = slot * token_len_local
 
                 self._downscale_info[engine_id] = {
                     "group_size": group_size,
@@ -1054,25 +1100,25 @@ class DynamoNixlConnector:
                 }
 
                 self.dst_num_blocks[engine_id] = num_blocks * B
-
                 logger.info(
                     "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d",
                     group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len)
 
-                # 源（本地，token 粒度）
+                # 本地 token 粒度 src 句柄
                 if 1 not in self.src_xfer_side_handles:
-                    local_dev_id = int(torch.cuda.current_device())
-                    src_blocks = []
-                    for layer in range(self.num_layers):
-                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V
-                            for bid in range(self.num_blocks):
-                                base_block = base + bid * seg_len
-                                for t in range(B):
-                                    src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
-                    src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
-                    self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
+                    self.src_xfer_side_handles[1] = None
+                local_dev_id = int(torch.cuda.current_device())
+                src_blocks = []
+                for layer in range(self.num_layers):
+                    for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V
+                        for bid in range(self.num_blocks):
+                            base_block = base + bid * seg_len
+                            for t in range(B):
+                                src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
+                src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+                self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
-                # 目的（远端，token 粒度，对应 remote_rank）
+                # 远端 token 粒度 dst 句柄（单 peer）
                 if engine_id not in self.dst_xfer_side_handles:
                     self.dst_xfer_side_handles[engine_id] = {}
                 dst_blocks = []
@@ -1102,7 +1148,7 @@ class DynamoNixlConnector:
                 except Exception as e:
                     logger.debug("make_connection(%s) lazy: %s", self._remote_agents[engine_id][remote_rank], e)
 
-                # READ-DOWN：按块
+                # --- read_down: 本地/远端的块粒度句柄 ---
                 if "read_down_src" not in self.src_xfer_side_handles:
                     blocks_local = []
                     local_dev_id = int(torch.cuda.current_device())
@@ -1116,10 +1162,12 @@ class DynamoNixlConnector:
 
                 if engine_id not in self.dst_xfer_side_handles:
                     self.dst_xfer_side_handles[engine_id] = {}
+                remote_rank = self._downscale_info[engine_id]["remote_rank"]
+
                 blocks_remote = []
                 remote_dev_table = self.kv_caches_dev_ids.get(engine_id)
                 for layer in range(self.num_layers):
-                    layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                    layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [K_base, V_base]
                     layer_dev_ids = None
                     if remote_dev_table is not None:
                         layer_dev_ids = remote_dev_table[remote_rank][layer]
@@ -1138,6 +1186,7 @@ class DynamoNixlConnector:
                     self.dst_num_blocks_read = {}
                 self.dst_num_blocks_read[engine_id] = num_blocks
 
+                # 提前拨号一次（懒连接容错）
                 try:
                     self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
                 except Exception as e:
@@ -1150,7 +1199,7 @@ class DynamoNixlConnector:
                             self.dst_num_blocks[engine_id])
                 return agent_names
 
-            # ---------- UP/EQ ----------
+            # --------- UP/EQ path ----------
             assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
             logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
@@ -1202,32 +1251,12 @@ class DynamoNixlConnector:
 
     def get_done_tranfers(self) -> List[str]:
         """
-        1) 常规传输完成聚合
-        2) 顺带处理 new notifs：
-           - 收到 DOWN:<key>[|src=<engine>] 立即单播回 DOWN-ACK:<key>
+        归并“完成的传输”（用于 UP/EQ piggyback 通知的完成检测）。
+        注：通知 ACK 由后台线程/写端等待逻辑保证，不再依赖这里。
         """
         with self._timing.span("get_done_transfers"):
-            # ---- 先处理通知，并回 ACK ----
-            try:
-                notifs = self.nixl_wrapper.get_new_notifs()
-                if notifs:
-                    for n in notifs:
-                        payload = _notif_payload_of(n)
-                        if not payload:
-                            continue
-                        if payload.startswith(DOWN_PREFIX):
-                            key, src_engine = self._try_parse_down_payload(payload)
-                            logger.info("[NOTIF] recv %s key=%s src=%s", DOWN_PREFIX.rstrip(":"), key, src_engine or "?")
-                            self._send_ack_best_effort(key, src_engine_id=src_engine)
-                        elif payload.startswith(DOWN_ACK_PREFIX):
-                            # 打日志，让你能在日志里看到 DOWN_ACK
-                            logger.info("[DOWN_ACK] observed ack payload=%s", payload)
-            except Exception as e:
-                logger.debug("[NOTIF] processing failed: %s", e)
-
-            # ---- 归并传输完成 ----
             done_req_ids: List[str] = []
-            for req_id, handles in list(self._transfers.items()):
+            for req_id, handles in list(self._transfers.items()):  # 修正 itesms() -> items()
                 if not isinstance(req_id, str) or req_id == "":
                     logger.error("[DONE] illegal key (drop): type=%s repr=%r",
                                  type(req_id).__name__, req_id)
