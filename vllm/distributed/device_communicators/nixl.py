@@ -189,6 +189,7 @@ class DynamoNixlConnector:
 
             segments = [(lo, hi, token_ids_local[lo:hi], token_ids_remote[lo:hi])
                         for lo, hi in self._chunk_iter(len(token_ids_local), MAX_IOV)]
+            N = len(token_ids_local)
             for layer in range(self.num_layers):
                 base_layer_src = layer * (self.num_cache_entries * per_entry_src)
                 base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
