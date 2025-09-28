@@ -130,7 +130,7 @@ class DynamoNixlConnector:
             yield off, end
             off = end
 
-    @lru_cache(maxsize=256)
+    @lru_cache(maxsize=1024)
     def _expand_seq(self, start_block: int, n_blocks: int) -> Tuple[int, ...]:
         B = int(self.block_size)
         return tuple([t for b in range(start_block, start_block + n_blocks) for t in range(b * B, b * B + B)])
@@ -151,12 +151,10 @@ class DynamoNixlConnector:
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
-            # 环境变量可调参数（有默认值）
-            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))  # 每个请求携带的索引上限
-            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))  # 并发请求窗口
+            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))
+            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))
             BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
-            # 预构：我们依赖 add_remote_agent(DOWN) 里已经建好的 token 粒度 src/dst 句柄
             assert 1 in self.src_xfer_side_handles, "[WRITE-DOWN] missing src token handle"
             assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
                 "[WRITE-DOWN] missing dst token handle"
@@ -288,14 +286,12 @@ class DynamoNixlConnector:
                 break
             if st != "PROC":
                 raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
-            # 轻量轮询
             time.sleep(0.001)
 
         # ===== 传完在本机做重排：standard -> grouped =====
         # ngroups = tp_prefill // tp_decode
         ngroups = self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
         if ngroups <= 1:
-            # 等价或上行就不在这里重排
             return
 
         # 对本次涉及到的块区间做 GPU 重排（staging -> final）
