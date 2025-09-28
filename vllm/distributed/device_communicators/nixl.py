@@ -1045,7 +1045,6 @@ class DynamoNixlConnector:
                     self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
                 except Exception as e:
                     logger.debug("[ADD][READ-DOWN] make_connection lazy: %s", e)
-                self._tp_size[engine_id] = self._tp_size[self.engine_id]
 
                 logger.info("[ADD] downscale prepared: src_keys=%s dst_keys=%s dst_units(token)=%s",
                             list(self.src_xfer_side_handles.keys()),
