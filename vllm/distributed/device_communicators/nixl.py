@@ -24,7 +24,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from .kv_rearrange import rearrange_tensors
+from .kv_rearrange import rearrange_tensors, rearrange_tensors_read_down
 from contextlib import contextmanager
 from functools import lru_cache
 
@@ -79,6 +79,7 @@ class DynamoNixlConnector:
         self.prefill_dst_xfer_side_handles = defaultdict(dict)
         self.dst_xfer_side_handles = defaultdict(dict)
         self.dst_num_blocks = {}
+        self._remote_index_map = {}
 
         self.kv_caches_dev_ids = {}
 
@@ -151,16 +152,19 @@ class DynamoNixlConnector:
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
+            # 先拿到 remote_rank，再校验并取句柄（修复：句柄按 remote_rank 分槽）
+            remote_rank = info["remote_rank"]
+
             MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))
             MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))
             BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
             assert 1 in self.src_xfer_side_handles, "[WRITE-DOWN] missing src token handle"
-            assert dst_engine_id in self.dst_xfer_side_handles and 0 in self.dst_xfer_side_handles[dst_engine_id], \
+            assert dst_engine_id in self.dst_xfer_side_handles and remote_rank in self.dst_xfer_side_handles[dst_engine_id], \
                 "[WRITE-DOWN] missing dst token handle"
 
             src_hdl = self.src_xfer_side_handles[1]
-            dst_hdl = self.dst_xfer_side_handles[dst_engine_id][0]
+            dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
 
             # 把“这次要搬的 block 列表”展开为 token 索引（单位：token）
             # 注意：我们对 local/remote 分别展开，然后用同样的层×entry 顺序拼索引，保证一一对应
@@ -173,7 +177,6 @@ class DynamoNixlConnector:
             # 为了避免一次性分配 40+ 万长度的大列表带来的 Python 压力，
             # 这里逐层生成并切片发送。
             notify_payload = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
-            remote_rank = info["remote_rank"]
             remote_agent = self._remote_agents[dst_engine_id][remote_rank]
             is_leader = bool(info["notify_leader"])
 
@@ -297,7 +300,7 @@ class DynamoNixlConnector:
 
         # 对本次涉及到的块区间做 GPU 重排（staging -> final）
         # 注意：worker 调用 read_blocks(local, staging, remote, ...) 时，
-        #       local_block_ids = 目标（grouped），staging_block_ids = 临时（standard）。
+        #       local_block_ids = 目标（grouped），staging_block_ids = 临时（标准）。
         # 这里我们按 ranges 成批跑 kernel。
         local_ranges = self._get_ranges(local_block_ids)
         staging_ranges = self._get_ranges(local_block_ids)  # 与上面 1:1 对拷
@@ -751,7 +754,7 @@ class DynamoNixlConnector:
 
                 if down is not None:
                     self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
-                    if os.getenv("NIXL_DOWN_VERIFY", "0") == "1":
+                    if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
                         try:
                             if remote_block_ids:
                                 self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
@@ -989,7 +992,8 @@ class DynamoNixlConnector:
                                                    token_len_local, int(rdev)))
                 dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
                 t_prep0 = time.perf_counter_ns()
-                self.dst_xfer_side_handles[engine_id][0] = self.nixl_wrapper.prep_xfer_dlist(
+                # 修复：目的 dlist 句柄按 remote_rank 存储，而不是固定 key=0
+                self.dst_xfer_side_handles[engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
                     self._remote_agents[engine_id][remote_rank], dst_desc
                 )
                 self._timing.add("add_remote_agent.down_prep_dst_ns", time.perf_counter_ns() - t_prep0)
