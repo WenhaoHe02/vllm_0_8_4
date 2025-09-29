@@ -916,8 +916,11 @@ class DynamoNixlConnector:
             loc_base = self.kv_caches_base_addr[engine_id]
             loc_dev = self.kv_caches_dev_ids[engine_id]
 
-            assert len(agent_metadata) == agent_tp
-            assert len(loc_base) == agent_tp
+            if len(agent_metadata) != agent_tp:
+                raise RuntimeError(f"[ADD] agent_metadata len={len(agent_metadata)} != agent_tp={agent_tp}")
+            if len(loc_base) != agent_tp:
+                raise RuntimeError(f"[ADD] kv_caches_base_addr outer len={len(loc_base)} != agent_tp={agent_tp}")
+
             for r in range(agent_tp):
                 assert len(loc_base[r]) == self.num_layers
                 for L in range(self.num_layers):
