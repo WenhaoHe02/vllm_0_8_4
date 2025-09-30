@@ -170,17 +170,13 @@ class DynamoNixlConnector:
             token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
             token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
 
-            # 统一的通知载荷（bytes）与转账完成键（str）
             notify_payload = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
-            notify_key = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-
             remote_agent = self._remote_agents[dst_engine_id][remote_rank]
             is_leader = bool(info["notify_leader"])
 
             inflight = []
             total_reqs = 0
             last_req_args = None
-            all_handles = []  # 收集本 rank 的所有句柄，用于 done 计数
 
             per_entry_src = int(self.num_blocks) * int(self.block_size)
             per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
@@ -208,7 +204,6 @@ class DynamoNixlConnector:
                             )
                             self.nixl_wrapper.transfer(h)
                             inflight.append(h)
-                            all_handles.append(h)  # 记录句柄
                             total_reqs += 1
                             if len(inflight) >= MAX_INFLIGHT:
                                 self._wait_many(inflight)
@@ -223,8 +218,6 @@ class DynamoNixlConnector:
 
             # 最后一批 piggyback 通知；极端 0-token 情况下仅发通知
             if last_req_args is None:
-                # 无数据也要让“完成计数”前进：登记空集合表示马上 DONE
-                self._transfers.setdefault(notify_key, [])
                 if is_leader:
                     self.nixl_wrapper.send_notif(remote_agent, notify_payload)
                 return
@@ -238,12 +231,7 @@ class DynamoNixlConnector:
                 backends=BACKENDS
             )
             self.nixl_wrapper.transfer(h_last)
-            all_handles.append(h_last)  # 把带通知的最后一个也纳入
             self._wait_many([h_last])
-
-            # 关键：无论是否 leader，所有 peer 都把自己的所有句柄登记到同一个 notify_key
-            self._transfers.setdefault(notify_key, []).extend(all_handles)
-
             logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
 
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
@@ -383,6 +371,17 @@ class DynamoNixlConnector:
 
     def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: str,
                                group_size: int, peer_idx: int, is_leader: bool) -> None:
+        """
+        组内 barrier（仅 leader 等全员）。新增两个行为：
+        - NIXL_DOWN_BARRIER=0 时直接短路（用于快速定位/绕过）。
+        - NIXL_DOWN_WAIT_MS 超时（默认 200ms），超时打印缺席 peer 并继续，避免“永等”。
+        """
+        # 一键关闭（便于快速验证是否与 barrier 有关）
+        if os.getenv("NIXL_DOWN_BARRIER", "1") == "0":
+            logger.warning("[DOWN-BAR] bypassed by NIXL_DOWN_BARRIER=0 (dst=%s key=%s grp=%d idx=%d leader=%s)",
+                           dst_engine_id, self._peek([notify_key]), group_size, peer_idx, is_leader)
+            return
+
         d = self._barrier_dir(dst_engine_id, notify_key, group_size)
         my_flag = os.path.join(d, f"{peer_idx}.ok")
         try:
@@ -393,11 +392,22 @@ class DynamoNixlConnector:
 
         if not is_leader:
             return
+
+        # leader 等全员，带超时与缺席打印
         try:
+            wait_ms = int(os.getenv("NIXL_DOWN_WAIT_MS", "200"))
+            deadline = time.time() + (wait_ms / 1000.0)
             for i in range(group_size):
                 flag = os.path.join(d, f"{i}.ok")
                 while not os.path.exists(flag):
+                    if time.time() > deadline:
+                        missing = [j for j in range(group_size) if not os.path.exists(os.path.join(d, f"{j}.ok"))]
+                        logger.warning("[DOWN-BAR] timeout (%d ms): expected=%d, missing=%s ; continue",
+                                       wait_ms, group_size, missing[:8])
+                        # 超时后不再阻塞，允许继续流程，防止卡死
+                        break
                     time.sleep(0.001)
+
             # 清理
             for i in range(group_size):
                 try:
@@ -758,7 +768,7 @@ class DynamoNixlConnector:
                                 )
 
                 remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-                local_handle = self.src_xfer_side_handles[eff_tp]
+                local_handle = self.src_xfer_side_handles[tp_multiplier]
                 created, handles = 0, []
 
                 notify_payload_str = _to_notify_str(notify_msg)
