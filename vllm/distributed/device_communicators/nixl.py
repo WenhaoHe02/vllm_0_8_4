@@ -16,6 +16,7 @@
 import os
 import time
 import uuid
+import hashlib
 from collections import defaultdict
 from typing import List, Tuple, Optional
 
@@ -93,12 +94,49 @@ class DynamoNixlConnector:
 
         self._downscale_info = {}
 
+        # ---- engine_id fingerprinting (strict check) ----
+        self._engine_fingerprint = {}  # engine_id -> fp
+        self._engine_agent_tp = {}     # engine_id -> tp size for check
+
         # ---- timing ----
         self._timing = _Timing(
             enabled=_env_flag("NIXL_TIMING", True),
             tag=os.getenv("NIXL_TIMING_TAG", f"nixl.{engine_id}.r{rank}")
         )
         self._timing_autolog = _env_flag("NIXL_TIMING_LOG", False)
+
+    # --------- helpers for engine_id check ---------
+    def _agents_fingerprint(self, agent_metadata: List[bytes]) -> str:
+        h = hashlib.sha1()
+        for m in agent_metadata:
+            if isinstance(m, bytes):
+                h.update(m)
+            else:
+                h.update(bytes(m))
+        return h.hexdigest()
+
+    def _check_engine_id_reuse(self, engine_id: str, agent_metadata: List[bytes], agent_tp: int):
+        fp = self._agents_fingerprint(agent_metadata)
+        if engine_id in self._engine_fingerprint:
+            same_fp = (self._engine_fingerprint[engine_id] == fp)
+            same_tp = (self._engine_agent_tp.get(engine_id) == int(agent_tp))
+            if not same_fp:
+                strict = _env_flag("NIXL_STRICT_ENGINE_ID", True)
+                msg = (f"[ENGCHK] engine_id reused with different remote agents: engine_id={engine_id} "
+                       f"old_fp={self._engine_fingerprint[engine_id][:12]} new_fp={fp[:12]} "
+                       f"old_tp={self._engine_agent_tp.get(engine_id)} new_tp={agent_tp}")
+                if strict:
+                    logger.error(msg + " -> raising due to NIXL_STRICT_ENGINE_ID=1")
+                    raise RuntimeError(msg)
+                else:
+                    logger.warning(msg + " -> continuing (STRICT=0). Beware of handle overwrite.")
+            elif not same_tp:
+                logger.warning("[ENGCHK] same engine_id & same fingerprint but TP differs: engine_id=%s old_tp=%s new_tp=%s",
+                               engine_id, self._engine_agent_tp.get(engine_id), agent_tp)
+        else:
+            logger.info("[ENGCHK] first time engine_id=%s fp=%s tp=%s", engine_id, fp[:12], agent_tp)
+            self._engine_fingerprint[engine_id] = fp
+            self._engine_agent_tp[engine_id] = int(agent_tp)
 
     def _wait_many(self, handles):
         with self._timing.span("wait_many"):
@@ -170,7 +208,7 @@ class DynamoNixlConnector:
             token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
             token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
 
-            notify_payload = notify_msg if isinstance(notify_msg, (bytes, bytearray)) else str(notify_msg).encode()
+            notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
             remote_agent = self._remote_agents[dst_engine_id][remote_rank]
             is_leader = bool(info["notify_leader"])
 
@@ -199,7 +237,8 @@ class DynamoNixlConnector:
                                 "WRITE",
                                 src_hdl, local_idx,
                                 dst_hdl, remote_idx,
-                                b"",
+                                "" if notify_payload is None else ""
+                                ,
                                 backends=BACKENDS
                             )
                             self.nixl_wrapper.transfer(h)
@@ -219,6 +258,7 @@ class DynamoNixlConnector:
             # 最后一批 piggyback 通知；极端 0-token 情况下仅发通知
             if last_req_args is None:
                 if is_leader:
+                    logger.info("[NOTIF][DOWN-0tok] dst=%s remote_rank=%s key=%s", dst_engine_id, remote_rank, self._peek([notify_payload]))
                     self.nixl_wrapper.send_notif(remote_agent, notify_payload)
                 return
 
@@ -258,7 +298,7 @@ class DynamoNixlConnector:
             "READ",
             dst_handle, dst_desc_ids,
             src_handle, src_desc_ids,
-            b""
+            ""
         )
         self.nixl_wrapper.transfer(h)
         while True:
@@ -749,7 +789,9 @@ class DynamoNixlConnector:
                     logger.info("[WRITE] zero-block case")
                     for i in range(tp_multiplier):
                         trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
-                        self.nixl_wrapper.send_notif(trg, _to_notify_str(notify_msg))
+                        key = _to_notify_str(notify_msg)
+                        logger.info("[NOTIF][UP-0tok] dst=%s idx=%d key=%s", dst_engine_id, i, self._peek([key]))
+                        self.nixl_wrapper.send_notif(trg, key)
                     logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
@@ -856,6 +898,9 @@ class DynamoNixlConnector:
             logger.info("[ADD] num_blocks=%d dev_ids=%s", num_blocks, "Y" if kv_caches_dev_ids is not None else "N")
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
                 engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
+
+            # strict engine_id check
+            self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
             self._tp_size[engine_id] = int(agent_tp)
 
