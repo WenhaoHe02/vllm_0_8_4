@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Set, Tuple, Type, Union, TYPE_CHECKING,
 
 import torch
 import torch.distributed
-
+import torch.distributed as dist
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator

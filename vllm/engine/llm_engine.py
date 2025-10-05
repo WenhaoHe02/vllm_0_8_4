@@ -31,6 +31,7 @@ from typing import Sequence as GenericSequence
 from typing import Set, Type, Union, cast, overload
 
 import torch
+import torch.distributed as dist
 from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
