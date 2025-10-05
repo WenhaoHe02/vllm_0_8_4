@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import copy
 import time
 import pickle
@@ -2329,13 +2330,57 @@ class LLMEngine:
 
         return sampling_params
 
+    def _rank_world(self):
+        r = os.getenv("RANK", "?")
+        w = os.getenv("WORLD_SIZE", "?")
+        if dist and dist.is_available() and dist.is_initialized():
+            try:
+                r = dist.get_rank()
+                w = dist.get_world_size()
+            except Exception:
+                pass
+        return r, w
+
+
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
                        timeout: Optional[float] = None,
                        args: tuple = (),
                        kwargs: Optional[dict[str, Any]] = None) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args,
-                                                  kwargs)
+        mname = method if isinstance(method, str) else getattr(method, "__name__", str(method))
+        r, w = self._rank_world()
+
+        # 针对 add_remote_nixl_metadata 特殊展开参数便于排查
+        if mname == "add_remote_nixl_metadata":
+            try:
+                if args and hasattr(args[0], "engine_id"):
+                    eid = args[0].engine_id
+                    alen = len(args[0].agent_metadata)
+                    klen = len(args[0].kv_caches_base_addr)
+                    nblk = args[0].num_blocks
+                else:
+                    eid = args[0]
+                    alen = len(args[1])
+                    klen = len(args[2])
+                    nblk = args[3]
+            except Exception:
+                eid, alen, klen, nblk = "<parse-failed>", "?", "?", "?"
+            logger.info("[COLL-RPC][CALL][ADD_META] method=%s rank=%s/%s engine=%s agents=%s kv_rows=%s num_blocks=%s",
+                        mname, r, w, eid, alen, klen, nblk)
+        else:
+            logger.info("[COLL-RPC][CALL] method=%s rank=%s/%s", mname, r, w)
+
+        t0 = time.perf_counter()
+        out = None
+        try:
+            out = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+            return out
+        finally:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            otype = type(out).__name__ if out is not None else "<EXC>"
+            olen = len(out) if isinstance(out, (list, tuple)) else "-"
+            logger.info("[COLL-RPC][RET] method=%s rank=%s/%s dur_ms=%.2f out_type=%s out_len=%s",
+                        mname, r, w, dt_ms, otype, olen)
 
 
 if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:

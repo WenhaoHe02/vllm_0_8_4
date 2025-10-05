@@ -338,9 +338,21 @@ class Worker(LocalOrDistributedWorkerBase):
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
         return self.nixl_connector.get_agent_metadata()
 
-    def add_remote_nixl_metadata(self, engine_id: str, agents_metadata: List[bytes], kv_caches_base_addr: List[List[Tuple[int, int]]], num_blocks: int) -> str:
+    def add_remote_nixl_metadata(self, engine_id: str,
+                                 agents_metadata: List[bytes],
+                                 kv_caches_base_addr: List[List[Tuple[int, int]]],
+                                 num_blocks: int) -> str:
+        r, w = _rank_world()  # 复用上面的小工具函数，或复制那段取 rank/world 的代码
+        logger.info("[WORKER.ADD_META][ENTER] rank=%s/%s pid=%s engine=%s agents=%d kv_rows=%d num_blocks=%d",
+                    r, w, os.getpid(), engine_id, len(agents_metadata), len(kv_caches_base_addr), num_blocks)
+
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
-        agent_name = self.nixl_connector.add_remote_agent(engine_id, agents_metadata, len(agents_metadata), kv_caches_base_addr, num_blocks) # TODO ptarasiewicz: rank or local_rank?
+        agent_name = self.nixl_connector.add_remote_agent(
+            engine_id, agents_metadata, len(agents_metadata),
+            kv_caches_base_addr, num_blocks
+        )
+        logger.info("[WORKER.ADD_META][RET] rank=%s/%s engine=%s agent_name=%s",
+                    r, w, engine_id, agent_name)
         return agent_name
 
     def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
