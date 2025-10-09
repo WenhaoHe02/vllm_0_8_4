@@ -795,20 +795,75 @@ class DynamoNixlConnector:
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
+                # ---- 就绪检查（≤ NIXL_WRITE_RDY_MS 毫秒，默认 200ms）防止 KeyError/静默卡住 ----
+                import time as _t
+                WAIT_MS = int(os.getenv("NIXL_WRITE_RDY_MS", "200"))
+                deadline = _t.time() + WAIT_MS / 1000.0
+
+                def _ready_for(dst: str):
+                    # 1) TP 映射是否就绪
+                    tp_dst = self._tp_size.get(dst, None)
+                    tp_src = self._tp_size.get(self.engine_id, None)
+                    if tp_dst is None or tp_src is None:
+                        return False, "tp_size_missing"
+                    tp_mult = tp_dst // max(1, tp_src)
+
+                    # 2) 路径所需句柄/信息是否齐全
+                    if tp_mult == 0 and not self._is_mla:
+                        # down 路径：需要 downscale_info + 必要句柄
+                        info = self._downscale_info.get(dst)
+                        if info is None:
+                            return False, "downscale_info_missing"
+                        if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
+                            return False, "src_handle_down_missing"
+                        rr = info.get("remote_rank", None)
+                        if (dst not in self.dst_xfer_side_handles or
+                                rr not in self.dst_xfer_side_handles[dst] or
+                                self.dst_xfer_side_handles[dst][rr] is None):
+                            return False, f"dst_handle_down_missing(rr={rr})"
+                    else:
+                        # up/equal 路径：检查对应 key 的句柄是否齐全
+                        eff_tp = max(1, tp_mult)
+                        if (eff_tp not in self.src_xfer_side_handles or
+                                self.src_xfer_side_handles[eff_tp] is None):
+                            return False, f"src_handle_up_missing(key={eff_tp})"
+                        if dst not in self.dst_xfer_side_handles:
+                            return False, "dst_handles_up_missing"
+                        for i in range(eff_tp):
+                            if i not in self.dst_xfer_side_handles[dst] or self.dst_xfer_side_handles[dst][i] is None:
+                                return False, f"dst_handle_up_missing(i={i})"
+                    return True, ""
+
+                ok, why = _ready_for(dst_engine_id)
+                while (not ok) and (_t.time() < deadline):
+                    _t.sleep(0.001)
+                    ok, why = _ready_for(dst_engine_id)
+
+                if not ok:
+                    raise RuntimeError(
+                        f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {why} ; "
+                        f"_tp_size_keys={list(self._tp_size.keys())} "
+                        f"src_keys={list(self.src_xfer_side_handles.keys())} "
+                        f"dst_keys_top={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}"
+                    )
+
+                # 就绪后再读取分支条件与 tp_multiplier
                 down = self._downscale_info.get(dst_engine_id)
                 tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
 
                 def _to_notify_str(x):
                     return x if isinstance(x, str) else str(x)
 
-                if down is not None:
-                    # 再次做强断言（与 _write_blocks_down 对齐），便于日志在上一层出现
+                # ---------- down 路径 ----------
+                if down is not None and (tp_multiplier == 0 and not self._is_mla):
+                    # 这里的强断言仍保留（按原逻辑），基本不应再触发
                     info = self._downscale_info[dst_engine_id]
                     remote_rank = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                        raise RuntimeError(f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}")
+                        raise RuntimeError(
+                            f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}")
                     if (dst_engine_id not in self.dst_xfer_side_handles or
-                        remote_rank not in self.dst_xfer_side_handles[dst_engine_id]):
+                            remote_rank not in self.dst_xfer_side_handles[dst_engine_id]):
                         raise RuntimeError(f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={remote_rank}) "
                                            f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
                                            f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}")
@@ -827,6 +882,7 @@ class DynamoNixlConnector:
                             logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
+                # ---------- up/equal 路径（原逻辑保持不变） ----------
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
 
@@ -865,7 +921,7 @@ class DynamoNixlConnector:
                                 )
 
                 remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-                local_handle = self.src_xfer_side_handles[tp_multiplier]
+                local_handle = self.src_xfer_side_handles[eff_tp]
                 created, handles = 0, []
 
                 notify_payload_str = _to_notify_str(notify_msg)
@@ -907,7 +963,7 @@ class DynamoNixlConnector:
                             raise RuntimeError(f"[WRITE] transfer failed with state {st}")
                     pending = nxt
                     if pending:
-                        time.sleep(0.001)
+                        _t.sleep(0.001)
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
 
                 if self._timing_autolog:
