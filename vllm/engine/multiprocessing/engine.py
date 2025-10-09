@@ -379,47 +379,52 @@ class MQLLMEngine:
     def handle_new_input(self):
         """Handle new input from the socket"""
         try:
+            import time
             from collections import deque
             try:
                 from concurrent.futures import ThreadPoolExecutor
             except Exception:
                 ThreadPoolExecutor = None
 
-            # --- 懒加载：内部状态 ---
+            # ---------- 懒加载内部状态 ----------
             if not hasattr(self, "_nixl_md_pending"):
                 self._nixl_md_pending = deque()  # 待应用的 NixlMetadata
             if not hasattr(self, "_nixl_md_seen"):
                 self._nixl_md_seen = set()  # 去重：(engine_id, rank)
             if not hasattr(self, "_nixl_md_futures"):
                 self._nixl_md_futures = deque()  # 在跑的 add_remote futures
-            if not hasattr(self, "_bootstrap_engines"):
-                self._bootstrap_engines = set()  # 仍未注册到 _tp_size 的 engine_id
+            if not hasattr(self, "_bootstrap_deadline"):
+                self._bootstrap_deadline = {}  # engine_id -> monotonic 截止时间
             if not hasattr(self, "_pending_process_reqs"):
-                self._pending_process_reqs = deque()  # 被暂缓的 RPCProcessRequest
+                self._pending_process_reqs = deque()  # 暂缓的 RPCProcessRequest
 
             if ThreadPoolExecutor and not hasattr(self, "_nixl_md_executor"):
+                # 单线程后台执行 add_remote，避免阻塞 I/O
                 self._nixl_md_executor = ThreadPoolExecutor(max_workers=1)
 
-            # 访问底层连接器上的 tp_size（用于判断“已注册”）
+            # 访问底层 tp_size（判断某 engine 是否已注册）
             connector = getattr(self.engine, "nixl_connector", None)
             tp_size_map = getattr(connector, "_tp_size", {}) if connector else {}
 
-            # --- 清理已完成的 futures，并更新 bootstrap 完成情况 ---
-            changed = False
+            # ---------- 清理已完成的 futures ----------
             while self._nixl_md_futures and getattr(self._nixl_md_futures[0], "done", lambda: True)():
-                fut = self._nixl_md_futures.popleft()
-                changed = True
+                self._nixl_md_futures.popleft()
 
-            if changed and self._bootstrap_engines:
-                # 如果有任何引擎已注册，则移出 bootstrap
-                done_set = {eid for eid in list(self._bootstrap_engines) if eid in tp_size_map}
-                if done_set:
-                    self._bootstrap_engines.difference_update(done_set)
+            now = time.monotonic()
+            BOOTSTRAP_TTL = 0.20  # 新 engine_id 的“软门闩”时间窗（秒）
+            MAX_PENDING_REQS = 1024
+            MAX_SUBMIT_PER_TICK = 2
+            MAX_INFLIGHT = 1
+
+            # 过期清理 bootstrap 截止时间
+            for eid in list(self._bootstrap_deadline.keys()):
+                if (eid in tp_size_map) or (now >= self._bootstrap_deadline[eid]):
+                    self._bootstrap_deadline.pop(eid, None)
 
             progressed = False
 
-            # ========== 1) 先处理一条元数据（公平、单条） ==========
-            if self.engine.is_nixl_initialized and self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
+            # ---------- 1) 先处理一条元数据（公平、单条；不再被 is_nixl_initialized 限制） ----------
+            if self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
                 md_frame = self.remote_nixl_metadata_socket.recv(copy=False)
                 try:
                     nixl_md = msgspec.msgpack.decode(md_frame.buffer, type=NixlMetadata)
@@ -429,66 +434,73 @@ class MQLLMEngine:
 
                     if key not in self._nixl_md_seen:
                         self._nixl_md_seen.add(key)
-                        # 若目标引擎尚未在 _tp_size 中，标记为 bootstrap 并提到队首，提高优先级
-                        if eid and eid not in tp_size_map:
-                            self._bootstrap_engines.add(eid)
-                            self._nixl_md_pending.appendleft(nixl_md)  # 提前处理
+                        # 若是新 engine，且尚未注册，开启短暂的“软门闩”
+                        if eid and eid not in tp_size_map and eid not in self._bootstrap_deadline:
+                            self._bootstrap_deadline[eid] = now + BOOTSTRAP_TTL
+                            # 优先处理这条，尽快完成注册
+                            self._nixl_md_pending.appendleft(nixl_md)
                         else:
                             self._nixl_md_pending.append(nixl_md)
                 except Exception:
                     logger.exception("Decode NixlMetadata failed")
                 progressed = True
 
-            # ========== 2) 将待处理的元数据提交给后台执行器（限流，不阻塞） ==========
-            MAX_SUBMIT_PER_TICK = 2
-            MAX_INFLIGHT = 1
+            # ---------- 2) 限流地把元数据提交到后台执行（不阻塞 I/O） ----------
             if ThreadPoolExecutor and hasattr(self, "_nixl_md_executor"):
                 submits = 0
                 while (submits < MAX_SUBMIT_PER_TICK and
                        self._nixl_md_pending and
                        len(self._nixl_md_futures) < MAX_INFLIGHT):
                     md = self._nixl_md_pending.popleft()
-                    eid = getattr(md, "engine_id", None)
                     fut = self._nixl_md_executor.submit(self.engine.add_remote_nixl_metadata, md)
-                    # 将 engine_id 附在 future 上，便于上面清理时判断（可选）
-                    setattr(fut, "_eid", eid)
                     self._nixl_md_futures.append(fut)
                     submits += 1
                     progressed = True
 
-            # 再次查看是否已有引擎注册完成，尽快解除引导状态
-            if self._bootstrap_engines:
-                done_set = {eid for eid in list(self._bootstrap_engines) if eid in tp_size_map}
-                if done_set:
-                    self._bootstrap_engines.difference_update(done_set)
+            # 再刷一遍 tp_size_map 和过期 bootstrap（避免用旧快照）
+            tp_size_map = getattr(connector, "_tp_size", {}) if connector else {}
+            now = time.monotonic()
+            for eid in list(self._bootstrap_deadline.keys()):
+                if (eid in tp_size_map) or (now >= self._bootstrap_deadline[eid]):
+                    self._bootstrap_deadline.pop(eid, None)
 
-            # ========== 3) 先处理一个被暂缓的 ProcessRequest（若已无引导中的引擎） ==========
-            if not self._bootstrap_engines and self._pending_process_reqs:
+            # ---------- 3) 若已无 bootstrap 引擎，先释放一条暂缓的 ProcessRequest ----------
+            if not self._bootstrap_deadline and self._pending_process_reqs:
                 req, lprocs = self._pending_process_reqs.popleft()
                 if lprocs is not None and isinstance(req.params, SamplingParams):
                     req.params.logits_processors = lprocs
                 self._handle_process_request(req)
                 progressed = True
 
-            # ========== 4) 公平处理输入 socket：只取一条 ==========
+            # ---------- 4) 输入通道：公平只取一条；仅在短暂窗口内“软阻塞”新的 ProcessRequest ----------
             if self.input_socket.poll(timeout=0) != 0:
                 frames = self.input_socket.recv_multipart(copy=False)
                 request = pickle.loads(frames[0].buffer)
 
-                # 若还有“引导中”引擎，暂缓新的 ProcessRequest，避免先于元数据注册就触发 write_blocks
-                if isinstance(request, RPCProcessRequest) and self._bootstrap_engines:
-                    lprocs = None
-                    if len(frames) > 1 and isinstance(request.params, SamplingParams):
-                        try:
-                            lprocs = cloudpickle.loads(frames[1].buffer)
-                        except Exception:
-                            logger.exception("Decode logits processors failed")
-                    self._pending_process_reqs.append((request, lprocs))
-                    # 不立即处理，以免触发写块 KeyError
-                    progressed = True
+                if isinstance(request, RPCProcessRequest) and self._bootstrap_deadline:
+                    # 只在极短窗口内缓冲；队列过大则直接放行，绝不全局卡死
+                    if len(self._pending_process_reqs) < MAX_PENDING_REQS:
+                        lprocs = None
+                        if len(frames) > 1 and isinstance(request.params, SamplingParams):
+                            try:
+                                lprocs = cloudpickle.loads(frames[1].buffer)
+                            except Exception:
+                                logger.exception("Decode logits processors failed")
+                        self._pending_process_reqs.append((request, lprocs))
+                        progressed = True
+                    else:
+                        # 队列过大，直接处理以避免整体停摆
+                        if len(frames) > 1 and isinstance(request.params, SamplingParams):
+                            try:
+                                lprocs = cloudpickle.loads(frames[1].buffer)
+                                request.params.logits_processors = lprocs
+                            except Exception:
+                                logger.exception("Decode logits processors failed")
+                        self._handle_process_request(request)
+                        progressed = True
 
                 else:
-                    # 其余请求照常即时处理（Abort/Reset/WakeUp 等不应被延迟）
+                    # 其他请求/或无引导窗口：立即处理
                     if isinstance(request, RPCProcessRequest):
                         if len(frames) > 1:
                             assert isinstance(request.params, SamplingParams)
