@@ -379,59 +379,118 @@ class MQLLMEngine:
     def handle_new_input(self):
         """Handle new input from the socket"""
         try:
-            # --- 懒加载：用于异步执行 add_remote_nixl_metadata，避免阻塞 I/O 线程 ---
             from collections import deque
             try:
                 from concurrent.futures import ThreadPoolExecutor
-            except Exception:  # 极端精简环境下的兜底
+            except Exception:
                 ThreadPoolExecutor = None
 
+            # --- 懒加载：内部状态 ---
             if not hasattr(self, "_nixl_md_pending"):
-                self._nixl_md_pending = deque()  # 等待提交到 executor 的 NixlMetadata
+                self._nixl_md_pending = deque()  # 待应用的 NixlMetadata
             if not hasattr(self, "_nixl_md_seen"):
                 self._nixl_md_seen = set()  # 去重：(engine_id, rank)
             if not hasattr(self, "_nixl_md_futures"):
-                self._nixl_md_futures = deque()  # 在跑的任务
+                self._nixl_md_futures = deque()  # 在跑的 add_remote futures
+            if not hasattr(self, "_bootstrap_engines"):
+                self._bootstrap_engines = set()  # 仍未注册到 _tp_size 的 engine_id
+            if not hasattr(self, "_pending_process_reqs"):
+                self._pending_process_reqs = deque()  # 被暂缓的 RPCProcessRequest
+
             if ThreadPoolExecutor and not hasattr(self, "_nixl_md_executor"):
-                # 单线程执行，保证顺序且隔离耗时调用
                 self._nixl_md_executor = ThreadPoolExecutor(max_workers=1)
 
-            # 定期清理已完成的任务，防止无限堆积
-            while self._nixl_md_futures and getattr(self._nixl_md_futures[0], "done", lambda: True)():
-                self._nixl_md_futures.popleft()
+            # 访问底层连接器上的 tp_size（用于判断“已注册”）
+            connector = getattr(self.engine, "nixl_connector", None)
+            tp_size_map = getattr(connector, "_tp_size", {}) if connector else {}
 
-            # 每轮最多处理的 add_remote 提交次数（限流；>0 才会异步提交）
-            MAX_SUBMIT_PER_TICK = 1
-            MAX_INFLIGHT = 1  # 在跑的后台任务上限
+            # --- 清理已完成的 futures，并更新 bootstrap 完成情况 ---
+            changed = False
+            while self._nixl_md_futures and getattr(self._nixl_md_futures[0], "done", lambda: True)():
+                fut = self._nixl_md_futures.popleft()
+                changed = True
+
+            if changed and self._bootstrap_engines:
+                # 如果有任何引擎已注册，则移出 bootstrap
+                done_set = {eid for eid in list(self._bootstrap_engines) if eid in tp_size_map}
+                if done_set:
+                    self._bootstrap_engines.difference_update(done_set)
 
             progressed = False
 
-            if self.engine.is_nixl_initialized:
-                # ---------- 1) 公平轮询：元数据通道，最多取一条 ----------
-                if self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
-                    md_frame = self.remote_nixl_metadata_socket.recv(copy=False)
-                    try:
-                        nixl_metadata = msgspec.msgpack.decode(md_frame.buffer, type=NixlMetadata)
-                        # 简单去重：按 (engine_id, rank) 去重，避免重复阻塞处理
-                        key = (getattr(nixl_metadata, "engine_id", None),
-                               getattr(nixl_metadata, "rank", None))
-                        if key not in self._nixl_md_seen:
-                            self._nixl_md_seen.add(key)
-                            self._nixl_md_pending.append(nixl_metadata)
-                            # 仅记录，不在 I/O 线程里直接调用 add_remote*
-                            # logger.debug("Queued remote nixl metadata for engine: %s", key[0])
-                    except Exception:
-                        logger.exception("Decode NixlMetadata failed")
+            # ========== 1) 先处理一条元数据（公平、单条） ==========
+            if self.engine.is_nixl_initialized and self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
+                md_frame = self.remote_nixl_metadata_socket.recv(copy=False)
+                try:
+                    nixl_md = msgspec.msgpack.decode(md_frame.buffer, type=NixlMetadata)
+                    eid = getattr(nixl_md, "engine_id", None)
+                    rank = getattr(nixl_md, "rank", None)
+                    key = (eid, rank)
+
+                    if key not in self._nixl_md_seen:
+                        self._nixl_md_seen.add(key)
+                        # 若目标引擎尚未在 _tp_size 中，标记为 bootstrap 并提到队首，提高优先级
+                        if eid and eid not in tp_size_map:
+                            self._bootstrap_engines.add(eid)
+                            self._nixl_md_pending.appendleft(nixl_md)  # 提前处理
+                        else:
+                            self._nixl_md_pending.append(nixl_md)
+                except Exception:
+                    logger.exception("Decode NixlMetadata failed")
+                progressed = True
+
+            # ========== 2) 将待处理的元数据提交给后台执行器（限流，不阻塞） ==========
+            MAX_SUBMIT_PER_TICK = 2
+            MAX_INFLIGHT = 1
+            if ThreadPoolExecutor and hasattr(self, "_nixl_md_executor"):
+                submits = 0
+                while (submits < MAX_SUBMIT_PER_TICK and
+                       self._nixl_md_pending and
+                       len(self._nixl_md_futures) < MAX_INFLIGHT):
+                    md = self._nixl_md_pending.popleft()
+                    eid = getattr(md, "engine_id", None)
+                    fut = self._nixl_md_executor.submit(self.engine.add_remote_nixl_metadata, md)
+                    # 将 engine_id 附在 future 上，便于上面清理时判断（可选）
+                    setattr(fut, "_eid", eid)
+                    self._nixl_md_futures.append(fut)
+                    submits += 1
                     progressed = True
 
-                # ---------- 2) 公平轮询：输入通道，最多取一条 ----------
-                if self.input_socket.poll(timeout=0) != 0:
-                    frames = self.input_socket.recv_multipart(copy=False)
-                    request = pickle.loads(frames[0].buffer)
+            # 再次查看是否已有引擎注册完成，尽快解除引导状态
+            if self._bootstrap_engines:
+                done_set = {eid for eid in list(self._bootstrap_engines) if eid in tp_size_map}
+                if done_set:
+                    self._bootstrap_engines.difference_update(done_set)
 
+            # ========== 3) 先处理一个被暂缓的 ProcessRequest（若已无引导中的引擎） ==========
+            if not self._bootstrap_engines and self._pending_process_reqs:
+                req, lprocs = self._pending_process_reqs.popleft()
+                if lprocs is not None and isinstance(req.params, SamplingParams):
+                    req.params.logits_processors = lprocs
+                self._handle_process_request(req)
+                progressed = True
+
+            # ========== 4) 公平处理输入 socket：只取一条 ==========
+            if self.input_socket.poll(timeout=0) != 0:
+                frames = self.input_socket.recv_multipart(copy=False)
+                request = pickle.loads(frames[0].buffer)
+
+                # 若还有“引导中”引擎，暂缓新的 ProcessRequest，避免先于元数据注册就触发 write_blocks
+                if isinstance(request, RPCProcessRequest) and self._bootstrap_engines:
+                    lprocs = None
+                    if len(frames) > 1 and isinstance(request.params, SamplingParams):
+                        try:
+                            lprocs = cloudpickle.loads(frames[1].buffer)
+                        except Exception:
+                            logger.exception("Decode logits processors failed")
+                    self._pending_process_reqs.append((request, lprocs))
+                    # 不立即处理，以免触发写块 KeyError
+                    progressed = True
+
+                else:
+                    # 其余请求照常即时处理（Abort/Reset/WakeUp 等不应被延迟）
                     if isinstance(request, RPCProcessRequest):
                         if len(frames) > 1:
-                            # Use cloudpickle for logits processors
                             assert isinstance(request.params, SamplingParams)
                             try:
                                 lprocs = cloudpickle.loads(frames[1].buffer)
@@ -471,20 +530,6 @@ class MQLLMEngine:
                         raise ValueError("Unknown RPCRequest Type: " f"{type(request)}")
 
                     progressed = True
-
-                # ---------- 3) 限流异步提交：把待处理的元数据交给后台 ----------
-                # 只在 executor 可用时启用异步；否则（极端环境）仍可选择同步提交但会阻塞，这里宁可跳过
-                if ThreadPoolExecutor and hasattr(self, "_nixl_md_executor"):
-                    submits = 0
-                    while (submits < MAX_SUBMIT_PER_TICK and
-                           self._nixl_md_pending and
-                           len(self._nixl_md_futures) < MAX_INFLIGHT):
-                        md = self._nixl_md_pending.popleft()
-                        # 这里真正调用 add_remote*，但放在后台线程执行，避免卡住 I/O 线程
-                        fut = self._nixl_md_executor.submit(self.engine.add_remote_nixl_metadata, md)
-                        self._nixl_md_futures.append(fut)
-                        submits += 1
-                        progressed = True
 
             return progressed
 
