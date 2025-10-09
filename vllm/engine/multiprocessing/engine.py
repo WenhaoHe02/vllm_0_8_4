@@ -379,46 +379,114 @@ class MQLLMEngine:
     def handle_new_input(self):
         """Handle new input from the socket"""
         try:
+            # --- 懒加载：用于异步执行 add_remote_nixl_metadata，避免阻塞 I/O 线程 ---
+            from collections import deque
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+            except Exception:  # 极端精简环境下的兜底
+                ThreadPoolExecutor = None
+
+            if not hasattr(self, "_nixl_md_pending"):
+                self._nixl_md_pending = deque()  # 等待提交到 executor 的 NixlMetadata
+            if not hasattr(self, "_nixl_md_seen"):
+                self._nixl_md_seen = set()  # 去重：(engine_id, rank)
+            if not hasattr(self, "_nixl_md_futures"):
+                self._nixl_md_futures = deque()  # 在跑的任务
+            if ThreadPoolExecutor and not hasattr(self, "_nixl_md_executor"):
+                # 单线程执行，保证顺序且隔离耗时调用
+                self._nixl_md_executor = ThreadPoolExecutor(max_workers=1)
+
+            # 定期清理已完成的任务，防止无限堆积
+            while self._nixl_md_futures and getattr(self._nixl_md_futures[0], "done", lambda: True)():
+                self._nixl_md_futures.popleft()
+
+            # 每轮最多处理的 add_remote 提交次数（限流；>0 才会异步提交）
+            MAX_SUBMIT_PER_TICK = 1
+            MAX_INFLIGHT = 1  # 在跑的后台任务上限
+
+            progressed = False
+
             if self.engine.is_nixl_initialized:
-                while self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
-                    frames = self.remote_nixl_metadata_socket.recv(copy=False)
-                    nixl_metadata = msgspec.msgpack.decode(frames.buffer, type=NixlMetadata)
-                    logger.debug("Adding remote nixl metadata for engine: %s", nixl_metadata.engine_id)
-                    self.engine.add_remote_nixl_metadata(nixl_metadata)
+                # ---------- 1) 公平轮询：元数据通道，最多取一条 ----------
+                if self.remote_nixl_metadata_socket.poll(timeout=0) != 0:
+                    md_frame = self.remote_nixl_metadata_socket.recv(copy=False)
+                    try:
+                        nixl_metadata = msgspec.msgpack.decode(md_frame.buffer, type=NixlMetadata)
+                        # 简单去重：按 (engine_id, rank) 去重，避免重复阻塞处理
+                        key = (getattr(nixl_metadata, "engine_id", None),
+                               getattr(nixl_metadata, "rank", None))
+                        if key not in self._nixl_md_seen:
+                            self._nixl_md_seen.add(key)
+                            self._nixl_md_pending.append(nixl_metadata)
+                            # 仅记录，不在 I/O 线程里直接调用 add_remote*
+                            # logger.debug("Queued remote nixl metadata for engine: %s", key[0])
+                    except Exception:
+                        logger.exception("Decode NixlMetadata failed")
+                    progressed = True
 
-            while self.input_socket.poll(timeout=0) != 0:
-                frames = self.input_socket.recv_multipart(copy=False)
-                request = pickle.loads(frames[0].buffer)
+                # ---------- 2) 公平轮询：输入通道，最多取一条 ----------
+                if self.input_socket.poll(timeout=0) != 0:
+                    frames = self.input_socket.recv_multipart(copy=False)
+                    request = pickle.loads(frames[0].buffer)
 
-                if isinstance(request, RPCProcessRequest):
-                    if len(frames) > 1:
-                        # Use cloudpickle for logits processors
-                        assert isinstance(request.params, SamplingParams)
-                        lprocs = cloudpickle.loads(frames[1].buffer)
-                        request.params.logits_processors = lprocs
-                    self._handle_process_request(request)
-                elif isinstance(request, RPCAbortRequest):
-                    self._handle_abort_request(request)
-                elif isinstance(request, RPCUProfileRequest):
-                    if request == RPCUProfileRequest.START_PROFILE:
-                        self.start_profile()
+                    if isinstance(request, RPCProcessRequest):
+                        if len(frames) > 1:
+                            # Use cloudpickle for logits processors
+                            assert isinstance(request.params, SamplingParams)
+                            try:
+                                lprocs = cloudpickle.loads(frames[1].buffer)
+                                request.params.logits_processors = lprocs
+                            except Exception:
+                                logger.exception("Decode logits processors failed")
+                        self._handle_process_request(request)
+
+                    elif isinstance(request, RPCAbortRequest):
+                        self._handle_abort_request(request)
+
+                    elif isinstance(request, RPCUProfileRequest):
+                        if request == RPCUProfileRequest.START_PROFILE:
+                            self.start_profile()
+                        else:
+                            self.stop_profile()
+
+                    elif isinstance(request, RPCLoadAdapterRequest):
+                        self._handle_load_adapter_request(request)
+
+                    elif isinstance(request, RPCResetPrefixCacheRequest):
+                        self.reset_prefix_cache()
+
+                    elif isinstance(request, RPCSleepRequest):
+                        self.sleep(request.value)
+
+                    elif isinstance(request, RPCWakeUpRequest):
+                        self.wake_up(request.tags)
+
+                    elif isinstance(request, RPCIsSleepingRequest):
+                        self._handle_is_sleeping_request(request)
+
+                    elif isinstance(request, RPCHasUnfinishedRequestsRequest):
+                        self._handle_has_unfinished_requests_request(request)
+
                     else:
-                        self.stop_profile()
-                elif isinstance(request, RPCLoadAdapterRequest):
-                    self._handle_load_adapter_request(request)
-                elif isinstance(request, RPCResetPrefixCacheRequest):
-                    self.reset_prefix_cache()
-                elif isinstance(request, RPCSleepRequest):
-                    self.sleep(request.value)
-                elif isinstance(request, RPCWakeUpRequest):
-                    self.wake_up(request.tags)
-                elif isinstance(request, RPCIsSleepingRequest):
-                    self._handle_is_sleeping_request(request)
-                elif isinstance(request, RPCHasUnfinishedRequestsRequest):
-                    self._handle_has_unfinished_requests_request(request)
-                else:
-                    raise ValueError("Unknown RPCRequest Type: "
-                                     f"{type(request)}")
+                        raise ValueError("Unknown RPCRequest Type: " f"{type(request)}")
+
+                    progressed = True
+
+                # ---------- 3) 限流异步提交：把待处理的元数据交给后台 ----------
+                # 只在 executor 可用时启用异步；否则（极端环境）仍可选择同步提交但会阻塞，这里宁可跳过
+                if ThreadPoolExecutor and hasattr(self, "_nixl_md_executor"):
+                    submits = 0
+                    while (submits < MAX_SUBMIT_PER_TICK and
+                           self._nixl_md_pending and
+                           len(self._nixl_md_futures) < MAX_INFLIGHT):
+                        md = self._nixl_md_pending.popleft()
+                        # 这里真正调用 add_remote*，但放在后台线程执行，避免卡住 I/O 线程
+                        fut = self._nixl_md_executor.submit(self.engine.add_remote_nixl_metadata, md)
+                        self._nixl_md_futures.append(fut)
+                        submits += 1
+                        progressed = True
+
+            return progressed
 
         except Exception as e:
             self._set_errored(e)
