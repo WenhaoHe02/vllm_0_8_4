@@ -1068,13 +1068,13 @@ class DynamoNixlConnector:
         return self.nixl_wrapper.get_new_notifs()
 
     def add_remote_agent(
-        self,
-        engine_id: str,
-        agent_metadata: List[bytes],
-        agent_tp: int,
-        kv_caches_base_addr: List[List[List[int]]],
-        num_blocks: int,
-        kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
+            self,
+            engine_id: str,
+            agent_metadata: List[bytes],
+            agent_tp: int,
+            kv_caches_base_addr: List[List[List[int]]],
+            num_blocks: int,
+            kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
         with self._timing.span("add_remote_agent"):
             env_rank = os.getenv("RANK", "?")
@@ -1086,26 +1086,32 @@ class DynamoNixlConnector:
             except Exception:
                 pass
 
-            logger.info("[ADD][ENTER] pid=%s env.RANK=%s env.LOCAL_RANK=%s cuda_dev=%s", pid, env_rank, env_local_rank, dev)
+            logger.info("[ADD][ENTER] pid=%s env.RANK=%s env.LOCAL_RANK=%s cuda_dev=%s", pid, env_rank, env_local_rank,
+                        dev)
             logger.info("[ADD] num_blocks=%d dev_ids=%s", num_blocks, "Y" if kv_caches_dev_ids is not None else "N")
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
-                engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
+                        engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
             # strict engine_id check
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
             self._tp_size[engine_id] = int(agent_tp)
 
-            self._persist_remote_md_cache(
-                engine_id=engine_id,
-                agent_metadata=agent_metadata,
-                kv_caches_base_addr=kv_caches_base_addr,
-                num_blocks=num_blocks,
-                kv_caches_dev_ids=kv_caches_dev_ids,
-                agent_tp=agent_tp,
-            )
+            # 可选：持久化远端元数据
+            if hasattr(self, "_persist_remote_md_cache"):
+                try:
+                    self._persist_remote_md_cache(
+                        engine_id=engine_id,
+                        agent_metadata=agent_metadata,
+                        kv_caches_base_addr=kv_caches_base_addr,
+                        num_blocks=num_blocks,
+                        kv_caches_dev_ids=kv_caches_dev_ids,
+                        agent_tp=agent_tp,
+                    )
+                except Exception as e:
+                    logger.debug("[ADD] _persist_remote_md_cache failed: %s", e)
 
-            # 注册远端 agents（每个 engine 内部的 remote_rank: 0..agent_tp-1）
+            # 注册远端 agents
             agent_names: List[str] = []
             for meta in agent_metadata:
                 agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
@@ -1132,19 +1138,70 @@ class DynamoNixlConnector:
             logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                         tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
+            # ========= 仅为 DOWN 路径添加“engine_id→gpu_id”稳定映射（UP 路径不变）=========
+            # 角色判断：你的配置里 decode=VllmWorker(agent_tp==1)；prefill=PrefillWorker(agent_tp==2)
+            role = "VLLMWORKER" if int(agent_tp) == 1 else "PREFILLWORKER"
+
+            def _parse_pool(env_name: str, default_csv: str) -> list[int]:
+                s = os.getenv(env_name, default_csv).strip()
+                out = []
+                for t in s.split(","):
+                    t = t.strip()
+                    if t:
+                        try:
+                            out.append(int(t))
+                        except Exception:
+                            pass
+                return out
+
+            # 可用环境覆写；没有就用你现在的固定分配
+            vllm_pool = _parse_pool("NIXL_POOL_VLLMWORKER", "0,1")
+            prefill_pool = _parse_pool("NIXL_POOL_PREFILLWORKER", "2,3,4,5")
+
+            if not hasattr(self, "_engine_gpu_map"):
+                self._engine_gpu_map = {}  # engine_id -> gpu_id
+            if not hasattr(self, "_pool_cursor"):
+                self._pool_cursor = {"VLLMWORKER": 0, "PREFILLWORKER": 0}
+
+            def _alloc_gpu_for_engine(eid: str, role: str) -> int:
+                if eid in self._engine_gpu_map:
+                    return self._engine_gpu_map[eid]
+                pool = vllm_pool if role == "VLLMWORKER" else prefill_pool
+                if not pool:
+                    logger.warning("[ADD][MAP] empty pool for role=%s, fallback gpu=0", role)
+                    g = 0
+                else:
+                    idx = self._pool_cursor[role] % len(pool)
+                    g = int(pool[idx])
+                    self._pool_cursor[role] += 1
+                self._engine_gpu_map[eid] = g
+                logger.info("[ADD][MAP] engine=%s role=%s -> gpu_id=%d (pool=%s)", eid, role, g, pool)
+                return g
+
+            # 优先使用对端显式 dev_ids；否则用上面的规则映射
+            def _remote_dev_id(r_engine_id: str, r_idx: int, layer: int, entry_idx: int) -> int:
+                devs = self.kv_caches_dev_ids.get(r_engine_id)
+                if devs is not None:
+                    try:
+                        return int(devs[r_idx][layer][entry_idx])
+                    except Exception:
+                        logger.warning("[ADD] invalid kv_caches_dev_ids for engine=%s r=%d L=%d E=%d",
+                                       r_engine_id, r_idx, layer, entry_idx)
+                return _alloc_gpu_for_engine(r_engine_id, role)
+
             # ========= DOWN（prefill -> decode）路径 =========
             if tp_multiplier == 0 and not self._is_mla:
                 # group_size: 本端 TP / 远端 TP
                 group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
-                remote_rank = self.rank // group_size          # 该 prefill-rank 对应的 decode rank（engine 内部）
-                peer_idx = self.rank % group_size              # 组内序号
+                remote_rank = self.rank // group_size  # 该 prefill-rank 对应的 decode rank（engine 内部）
+                peer_idx = self.rank % group_size  # 组内序号
                 slot = peer_idx
 
                 B = int(self.block_size)
-                token_len_local = self.block_len // B          # = H_local * C * bytes
-                token_len_total = token_len_local * group_size # = H_total * C * bytes
-                seg_len = token_len_local * B                  # = B * H_local * C * bytes
-                full_len = token_len_total * B                 # = B * H_total * C * bytes
+                token_len_local = self.block_len // B  # = H_local * C * bytes
+                token_len_total = token_len_local * group_size  # = H_total * C * bytes
+                seg_len = token_len_local * B  # = B * H_local * C * bytes
+                full_len = token_len_total * B  # = B * H_total * C * bytes
                 peer_off_tok = slot * token_len_local
 
                 self._downscale_info[engine_id] = {
@@ -1161,9 +1218,10 @@ class DynamoNixlConnector:
 
                 logger.info(
                     "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d peer_off_tok=%d",
-                    group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len, peer_off_tok)
+                    group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len,
+                    peer_off_tok)
 
-                # 源（prefill，本机）token 粒度 dlist，按 token 切片
+                # 源（prefill，本机）token 粒度 dlist
                 if 1 not in self.src_xfer_side_handles:
                     self.src_xfer_side_handles[1] = None
                 local_dev_id = int(torch.cuda.current_device())
@@ -1178,18 +1236,20 @@ class DynamoNixlConnector:
                 src_desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
                 self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", src_desc)
 
-                # 目的（decode，对端 engine_id + remote_rank）token 粒度 dlist：**按 engine_id -> remote_rank 分桶**
+                # —— 仅此处改动：目的（decode）token 粒度 dlist 的 dev_id 改为“engine_id→gpu_id 映射或对端 dev_ids” —— #
                 if engine_id not in self.dst_xfer_side_handles:
                     self.dst_xfer_side_handles[engine_id] = {}
+
                 dst_blocks = []
                 for layer in range(self.num_layers):
                     layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
                     for entry_idx, rbase in enumerate(layer_bases):  # K、V
+                        rdev = _remote_dev_id(engine_id, remote_rank, layer, entry_idx)
                         for bid in range(num_blocks):
                             base_block = rbase + bid * full_len
                             for t in range(B):
                                 dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
-                                                   token_len_local, int(remote_rank)))
+                                                   token_len_local, rdev))
                 logger.debug("[ADD][DOWN] dst_blocks(token) count=%d remote_rank=%d", len(dst_blocks), remote_rank)
                 dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
                 self.dst_xfer_side_handles[engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
@@ -1215,15 +1275,16 @@ class DynamoNixlConnector:
                     descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
                     self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
 
-                # 远端（decode）块布局 READ 来源
+                # —— 仅此处改动：远端（decode）块布局 READ 来源的 dev_id 同样用映射/显式 dev_ids —— #
                 blocks_remote = []
                 for layer in range(self.num_layers):
                     layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [K_base, V_base]
                     for entry_idx, rbase in enumerate(layer_bases):
+                        rdev = _remote_dev_id(engine_id, remote_rank, layer, entry_idx)
                         for bid in range(num_blocks):
                             block_offset = bid * self.block_len
-                            blocks_remote.append((rbase + block_offset, self.block_len, int(remote_rank)))
-                logger.debug("[ADD][DOWN] read_down_dst blocks(count)=%d remote_rank=%d", len(blocks_remote), remote_rank)
+                            blocks_remote.append((rbase + block_offset, self.block_len, rdev))
+                logger.debug("[ADD][DOWN] read_down_dst blocks(count)=%d remote_rank=%d", len(blocks_remote))
 
                 descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
                 self.dst_xfer_side_handles[engine_id]["read_down_dst"] = self.nixl_wrapper.prep_xfer_dlist(
@@ -1249,7 +1310,7 @@ class DynamoNixlConnector:
                             list(self.dst_xfer_side_handles[engine_id].keys()))
                 return agent_names
 
-            # ========= UP/EQ（decode -> decode 或尺寸相等）路径 =========
+            # ========= UP/EQ（decode -> decode 或尺寸相等）路径（保持官方逻辑，不改）=========
             assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
             logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
