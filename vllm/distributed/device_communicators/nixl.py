@@ -856,53 +856,70 @@ class DynamoNixlConnector:
                             dst_engine_id, len(local_block_ids), len(staging_block_ids),
                             len(remote_block_ids), type(notify_msg).__name__)
 
-                # --- 基本一致性 ---
+                # --- 长度一致性 ---
                 assert len(staging_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
                 # ===============================
-                #  有界自旋等待 “就绪” 条件
-                #  - DOWN 路径：存在 self._downscale_info[dst] 且 src/dst 句柄与 dst_num_blocks 就绪
-                #  - UP/EQ 路径：_tp_size 已有 dst/src，且 src/dst 句柄与 dst_num_blocks 就绪
+                #  就绪 GATING（有界自旋等待 + 元数据自采纳）
+                #  目标：在进入实际传输前，确保：
+                #   - DOWN：有 self._downscale_info[dst]、src句柄key=1、dst句柄key=(dst,remote_rank)、dst_num_blocks
+                #   - UP/EQ：有 _tp_size[dst]、src句柄key=tp_multiplier、dst句柄key=0..eff_tp-1、dst_num_blocks
+                #  期间会尝试从共享缓存“收养”远端元数据以填充缺失项。
                 # ===============================
                 wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
                 t0 = time.time()
                 last_missing = "unknown"
+
+                # 先尝试一次“收养”，以便最快补齐 _tp_size/_downscale_info
+                try:
+                    self._adopt_remote_md_from_cache(dst_engine_id)
+                except Exception as _e:
+                    logger.debug("[WRITE] adopt md first-shot failed: %s", _e)
+
                 while True:
-                    # ↓↓↓ 以 _downscale_info 是否存在作为 DOWN 的唯一判据
-                    down_info = self._downscale_info.get(dst_engine_id)
-                    if down_info is not None:
-                        rr = down_info.get("remote_rank")
+                    # 优先判断 DOWN 路径是否已准备好
+                    info = self._downscale_info.get(dst_engine_id)
+                    if info is not None:
+                        remote_rank = info.get("remote_rank")
                         src_ok = (1 in self.src_xfer_side_handles
                                   and self.src_xfer_side_handles[1] is not None)
                         dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
-                                  rr in self.dst_xfer_side_handles[dst_engine_id] and
-                                  self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
+                                  remote_rank in self.dst_xfer_side_handles[dst_engine_id] and
+                                  self.dst_xfer_side_handles[dst_engine_id][remote_rank] is not None)
                         nb_ok = (dst_engine_id in self.dst_num_blocks)
                         if src_ok and dst_ok and nb_ok:
-                            break
-                        last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
-
+                            break  # DOWN ready
+                        last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={remote_rank})"
                     else:
-                        # UP/EQ：直接用已记录的 tp_size（dst_tp ≡ agent_tp）
+                        # UP/EQ：需要 _tp_size[dst] 存在
                         tp_dst = self._tp_size.get(dst_engine_id)
                         tp_src = self._tp_size.get(self.engine_id)
                         if tp_dst is not None and tp_src is not None and tp_src > 0:
-                            tp_mult = tp_dst // tp_src
-                            eff_tp = max(1, tp_mult)
-                            src_ok = (tp_mult in self.src_xfer_side_handles
-                                      and self.src_xfer_side_handles[tp_mult] is not None)
+                            tp_multiplier = tp_dst // tp_src
+                            eff_tp = max(1, tp_multiplier)
+                            src_ok = (tp_multiplier in self.src_xfer_side_handles
+                                      and self.src_xfer_side_handles[tp_multiplier] is not None)
                             dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
                             dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
                             nb_ok = (dst_engine_id in self.dst_num_blocks)
-                            if tp_mult >= 1 and src_ok and dst_ok and nb_ok:
-                                break
+                            if tp_multiplier >= 1 and src_ok and dst_ok and nb_ok:
+                                break  # UP/EQ ready
                             last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
-                                            f"tp_mult={tp_mult}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
+                                            f"tp_mult={tp_multiplier}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
                         else:
                             last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
+
+                    # 如果还没准备好，尝试从共享缓存收养一次（可能由本机其它 rank 已持久化）
+                    try:
+                        adopted = self._adopt_remote_md_from_cache(dst_engine_id)
+                        if adopted:
+                            logger.info("[WRITE] adopted remote md for dst=%s while waiting", dst_engine_id)
+                            # 下一轮循环重新判定
+                    except Exception as _e:
+                        logger.debug("[WRITE] adopt md loop failed: %s", _e)
 
                     if (time.time() - t0) * 1000.0 > wait_ms:
                         raise RuntimeError(
@@ -910,40 +927,34 @@ class DynamoNixlConnector:
                             f"_tp_size_keys={list(self._tp_size.keys())} src_keys={list(self.src_xfer_side_handles.keys())} "
                             f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
                         )
-                    time.sleep(0.001)
+                    time.sleep(0.001)  # 轻量退避
 
-                # --- 分支：DOWN 或 UP/EQ ---
+                # --- 真正分支逻辑 ---
+                down = self._downscale_info.get(dst_engine_id)
+
                 def _to_notify_str(x):
                     return x if isinstance(x, str) else str(x)
 
-                if self._downscale_info.get(dst_engine_id) is not None:
+                if down is not None:
                     # 再做一次快速断言，日志更清晰
                     info = self._downscale_info[dst_engine_id]
-                    rr = info["remote_rank"]
+                    remote_rank = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
                         raise RuntimeError(
-                            f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}"
-                        )
+                            f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}")
                     if (dst_engine_id not in self.dst_xfer_side_handles or
-                            rr not in self.dst_xfer_side_handles[dst_engine_id] or
-                            self.dst_xfer_side_handles[dst_engine_id][rr] is None):
-                        raise RuntimeError(
-                            f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={rr}) "
-                            f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
-                            f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}"
-                        )
+                            remote_rank not in self.dst_xfer_side_handles[dst_engine_id]):
+                        raise RuntimeError(f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={remote_rank}) "
+                                           f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
+                                           f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}")
 
-                    # —— Down：prefill -> decode，token 粒度 —— #
                     self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
-
-                    # 可选校验
                     if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
                         try:
                             if remote_block_ids:
                                 self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
                         except Exception as e:
                             logger.warning("[DOWN-CHK] verify failed: %s", e)
-
                     logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
@@ -952,26 +963,28 @@ class DynamoNixlConnector:
                     return
 
                 # ===== UP / EQ 路径 =====
-                tp_mult = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
-                eff_tp = max(1, tp_mult)
+                tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+                eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
 
                 do_rearrange = False
-                staging_rr = None
+                staging_rearranging_ranges = None
                 if not self._is_mla:
                     local_ranges = self._get_ranges(local_block_ids)
                     staging_ranges = self._get_ranges(staging_block_ids)
-                    local_rr, staging_rr = self._get_same_length_ranges(local_ranges, staging_ranges)
+                    _local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(
+                        local_ranges, staging_ranges
+                    )
                     do_rearrange = True
 
-                # 0-block：仅发通知
                 if not local_block_ids:
-                    key = _to_notify_str(notify_msg)
-                    for i in range(tp_mult):
-                        trg = self._remote_agents[dst_engine_id][self.rank * tp_mult + i]
+                    logger.info("[WRITE] zero-block case")
+                    for i in range(tp_multiplier):
+                        trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
+                        key = _to_notify_str(notify_msg)
                         logger.info("[NOTIF][UP-0tok] dst=%s idx=%d key=%s", dst_engine_id, i, self._peek([key]))
                         self.nixl_wrapper.send_notif(trg, key)
-                    logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_mult)
+                    logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
                         if stats:
@@ -979,7 +992,7 @@ class DynamoNixlConnector:
                     return
 
                 if do_rearrange:
-                    for l_rng, s_rng in zip(local_rr, staging_rr):
+                    for l_rng, s_rng in zip(_local_rearranging_ranges, staging_rearranging_ranges):
                         for kv_cache in self.kv_caches:
                             for cache in kv_cache:
                                 rearrange_tensors(
@@ -988,27 +1001,27 @@ class DynamoNixlConnector:
                                     eff_tp, "write"
                                 )
 
-                remote_desc_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-                local_handle = self.src_xfer_side_handles[tp_mult]
+                remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
+                local_handle = self.src_xfer_side_handles[tp_multiplier]
                 created, handles = 0, []
 
                 notify_payload_str = _to_notify_str(notify_msg)
 
                 for i in targets:
-                    staging_desc_ids = self._get_block_descs_ids(
+                    staging_block_descs_ids = self._get_block_descs_ids(
                         self.engine_id, "all", staging_block_ids,
-                        i=i, tp_multiplier=eff_tp, staging_ranges=staging_rr
+                        i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
                     )
-                    if len(staging_desc_ids) != len(remote_desc_ids):
+                    if len(staging_block_descs_ids) != len(remote_block_descs_ids):
                         logger.error("[WRITE] desc mismatch staging=%d remote=%d (i=%d)",
-                                     len(staging_desc_ids), len(remote_desc_ids), i)
+                                     len(staging_block_descs_ids), len(remote_block_descs_ids), i)
                         raise RuntimeError("desc length mismatch")
                     remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
                     h = self.nixl_wrapper.make_prepped_xfer(
                         "WRITE",
-                        local_handle, staging_desc_ids,
-                        remote_handle, remote_desc_ids,
+                        local_handle, staging_block_descs_ids,
+                        remote_handle, remote_block_descs_ids,
                         notify_payload_str
                     )
                     if notify_payload_str:
@@ -1032,8 +1045,8 @@ class DynamoNixlConnector:
                     pending = nxt
                     if pending:
                         time.sleep(0.001)
-
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
+
                 if self._timing_autolog:
                     stats = self.get_timing(reset=True)
                     if stats:
