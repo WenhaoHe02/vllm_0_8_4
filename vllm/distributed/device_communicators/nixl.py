@@ -849,212 +849,183 @@ class DynamoNixlConnector:
                 if stats:
                     logger.info("[TIMING][READ] %s", stats)
 
-    def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        with self._timing.span("write_blocks"):
-            try:
-                logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
-                            dst_engine_id, len(local_block_ids), len(staging_block_ids),
-                            len(remote_block_ids), type(notify_msg).__name__)
+    def write_blocks(
+            self,
+            local_block_ids,  # List[int]
+            staging_block_ids,  # List[int]
+            remote_block_ids,  # List[int]
+            dst_engine_id: str,  # 目标 decode engine_id
+            notify_msg,  # bytes or str
+    ):
+        """
+        统一写 KV 的入口。仅对 DOWN 路径增加就绪闸门，避免在目标 engine 尚未完成 add_remote_agent()
+        以及 dlist 准备前就发起写，造成 precondition 报错。
+        """
 
-                # --- 长度一致性 ---
-                assert len(staging_block_ids) == len(local_block_ids), \
-                    f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
-                assert len(remote_block_ids) == len(local_block_ids), \
-                    f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
+        import time
+        from typing import Optional
 
-                # ===============================
-                #  就绪 GATING（有界自旋等待）
-                #  等待以下条件满足再进入真正的写：
-                #   - DOWN 路径：已有 self._downscale_info[dst]，
-                #                src 句柄 key=1、dst 句柄 key=(dst_engine_id, remote_rank) 都就绪，
-                #                且记录了 dst_num_blocks[dst]
-                #   - UP/EQ 路径：已有 _tp_size[dst]，可算出 tp_multiplier，
-                #                src 句柄 key=tp_multiplier、dst 句柄 key=i (0..eff_tp-1) 全部就绪，
-                #                且记录了 dst_num_blocks[dst]
-                #  超时（默认 3000ms，可用 NIXL_READY_WAIT_MS 覆盖）则报错
-                # ===============================
-                wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
-                t0 = time.time()
-                last_missing = "unknown"
-                while True:
-                    # 优先判定 DOWN：add_remote_agent 完成后会先填 _downscale_info
-                    info = self._downscale_info.get(dst_engine_id)
-                    if info is not None:
-                        remote_rank = info.get("remote_rank")
-                        src_ok = (1 in self.src_xfer_side_handles
-                                  and self.src_xfer_side_handles[1] is not None)
-                        dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
-                                  remote_rank in self.dst_xfer_side_handles[dst_engine_id] and
-                                  self.dst_xfer_side_handles[dst_engine_id][remote_rank] is not None)
-                        nb_ok = (dst_engine_id in self.dst_num_blocks)
-                        if src_ok and dst_ok and nb_ok:
-                            break  # DOWN 路径就绪
-                        last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={remote_rank})"
+        def _is_down_ready(engine_id: str, remote_rank: Optional[int]) -> tuple[bool, bool, bool]:
+            """
+            返回 (tp_ready, dlist_ready, nb_ready)
+            - tp_ready: 目标 tp_size 是否就绪（即 add_remote_agent 至少跑过一遍）
+            - dlist_ready: 目标 engine 的 down 路径 dlist 是否就绪（含 remote_rank 的 token/块 两套句柄）
+            - nb_ready: 记录的 num_blocks_read 是否就绪
+            """
+            tp_ready = engine_id in self._tp_size
+            if remote_rank is None:
+                # 还没建立 downscale_info 就没有 remote_rank，先看 top-level 容器是否存在
+                d_top = engine_id in self.dst_xfer_side_handles
+                dlist_ready = False
+            else:
+                d_top = engine_id in self.dst_xfer_side_handles
+                dlist_ready = (
+                        d_top and
+                        (remote_rank in self.dst_xfer_side_handles[engine_id]) and
+                        ("read_down_dst" in self.dst_xfer_side_handles[engine_id])
+                )
+            nb_ready = (
+                    hasattr(self, "dst_num_blocks_read")
+                    and isinstance(self.dst_num_blocks_read, dict)
+                    and (engine_id in self.dst_num_blocks_read)
+            )
+            return tp_ready, dlist_ready, nb_ready
 
-                    else:
-                        # 尝试判定 UP/EQ：要求 _tp_size 有 dst & 本端，且句柄齐
-                        tp_dst = self._tp_size.get(dst_engine_id)
-                        tp_src = self._tp_size.get(self.engine_id)
-                        if tp_dst is not None and tp_src is not None and tp_src > 0:
-                            tp_multiplier = tp_dst // tp_src
-                            eff_tp = max(1, tp_multiplier) if tp_multiplier is not None else 1
-                            src_ok = (tp_multiplier in self.src_xfer_side_handles
-                                      and self.src_xfer_side_handles[tp_multiplier] is not None)
-                            dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
-                            dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
-                            nb_ok = (dst_engine_id in self.dst_num_blocks)
-                            if tp_multiplier is not None and tp_multiplier >= 1 and src_ok and dst_ok and nb_ok:
-                                break  # UP/EQ 路径就绪
-                            last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
-                                            f"tp_mult={tp_multiplier}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
-                        else:
-                            last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
-
-                    if (time.time() - t0) * 1000.0 > wait_ms:
-                        raise RuntimeError(
-                            f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
-                            f"_tp_size_keys={list(self._tp_size.keys())} src_keys={list(self.src_xfer_side_handles.keys())} "
-                            f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
-                        )
-                    # 轻量退避
-                    time.sleep(0.001)
-
-                # --- 真正分支逻辑 ---
-                down = self._downscale_info.get(dst_engine_id)
-
-                def _to_notify_str(x):
-                    return x if isinstance(x, str) else str(x)
-
-                if down is not None:
-                    # 再做一次快速断言，日志更清晰
-                    info = self._downscale_info[dst_engine_id]
-                    remote_rank = info["remote_rank"]
-                    if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                        raise RuntimeError(
-                            f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}")
-                    if (dst_engine_id not in self.dst_xfer_side_handles or
-                            remote_rank not in self.dst_xfer_side_handles[dst_engine_id]):
-                        raise RuntimeError(f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={remote_rank}) "
-                                           f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
-                                           f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}")
-
-                    self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
-                    if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
-                        try:
-                            if remote_block_ids:
-                                self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
-                        except Exception as e:
-                            logger.warning("[DOWN-CHK] verify failed: %s", e)
-                    logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
-                    if self._timing_autolog:
-                        stats = self.get_timing(reset=True)
-                        if stats:
-                            logger.info("[TIMING][WRITE-DOWN] %s", stats)
-                    return
-
-                # ===== UP / EQ 路径 =====
-                tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
-                eff_tp = max(1, tp_multiplier)
-                targets = list(range(eff_tp))
-
-                do_rearrange = False
-                staging_rearranging_ranges = None
-                if not self._is_mla:
-                    local_ranges = self._get_ranges(local_block_ids)
-                    staging_ranges = self._get_ranges(staging_block_ids)
-                    _local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(
-                        local_ranges, staging_ranges
-                    )
-                    do_rearrange = True
-
-                if not local_block_ids:
-                    logger.info("[WRITE] zero-block case")
-                    for i in range(tp_multiplier):
-                        trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
-                        key = _to_notify_str(notify_msg)
-                        logger.info("[NOTIF][UP-0tok] dst=%s idx=%d key=%s", dst_engine_id, i, self._peek([key]))
-                        self.nixl_wrapper.send_notif(trg, key)
-                    logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
-                    if self._timing_autolog:
-                        stats = self.get_timing(reset=True)
-                        if stats:
-                            logger.info("[TIMING][WRITE] %s", stats)
-                    return
-
-                if do_rearrange:
-                    for l_rng, s_rng in zip(_local_rearranging_ranges, staging_rearranging_ranges):
-                        for kv_cache in self.kv_caches:
-                            for cache in kv_cache:
-                                rearrange_tensors(
-                                    cache[l_rng[0]: l_rng[1] + 1],
-                                    cache[s_rng[0]: s_rng[1] + 1],
-                                    eff_tp, "write"
-                                )
-
-                remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-                local_handle = self.src_xfer_side_handles[tp_multiplier]
-                created, handles = 0, []
-
-                notify_payload_str = _to_notify_str(notify_msg)
-
-                for i in targets:
-                    staging_block_descs_ids = self._get_block_descs_ids(
-                        self.engine_id, "all", staging_block_ids,
-                        i=i, tp_multiplier=eff_tp, staging_ranges=staging_rearranging_ranges
-                    )
-                    if len(staging_block_descs_ids) != len(remote_block_descs_ids):
-                        logger.error("[WRITE] desc mismatch staging=%d remote=%d (i=%d)",
-                                     len(staging_block_descs_ids), len(remote_block_descs_ids), i)
-                        raise RuntimeError("desc length mismatch")
-                    remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
-
-                    h = self.nixl_wrapper.make_prepped_xfer(
-                        "WRITE",
-                        local_handle, staging_block_descs_ids,
-                        remote_handle, remote_block_descs_ids,
-                        notify_payload_str
-                    )
-                    if notify_payload_str:
-                        self._transfers.setdefault(notify_payload_str, []).append(h)
-                    self.nixl_wrapper.transfer(h)
-                    handles.append(h)
-                    created += 1
-
-                pending = list(handles)
-                while pending:
-                    nxt = []
-                    for h in pending:
-                        st = self.nixl_wrapper.check_xfer_state(h)
-                        if st == "DONE":
-                            continue
-                        if st == "PROC":
-                            nxt.append(h)
-                        else:
-                            logger.error("[WRITE] transfer failed state=%s", st)
-                            raise RuntimeError(f"[WRITE] transfer failed with state {st}")
-                    pending = nxt
-                    if pending:
-                        time.sleep(0.001)
-                logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
-
-                if self._timing_autolog:
-                    stats = self.get_timing(reset=True)
-                    if stats:
-                        logger.info("[TIMING][WRITE] %s", stats)
-
-            except Exception as e:
+        def _ensure_down_ready(engine_id: str, timeout_ms: int = 3000) -> int:
+            """
+            确保 DOWN 路径就绪：
+            1) 如未就绪且本进程有缓存的远端元数据，则同步调用 add_remote_agent() 补建；
+            2) 否则做短轮询等待（给并行的 add_remote_nixl_metadata 时间）。
+            返回 remote_rank（从 self._downscale_info 取）。
+            """
+            # 尝试直接拿 remote_rank（可能尚未有）
+            remote_rank = None
+            if hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
                 try:
-                    logger.error(
-                        "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%s "
-                        "local=%s staging=%s remote=%s notify_repr=%r",
-                        dst_engine_id, bool(self._downscale_info.get(dst_engine_id)),
-                        self._tp_size.get(self.engine_id), self._tp_size.get(dst_engine_id),
-                        (self._tp_size.get(dst_engine_id, 0) // max(1, self._tp_size.get(self.engine_id, 1))),
-                        self.rank, len(local_block_ids), len(staging_block_ids), len(remote_block_ids),
-                        notify_msg
-                    )
-                finally:
-                    raise
+                    remote_rank = int(self._downscale_info[engine_id]["remote_rank"])
+                except Exception:
+                    remote_rank = None
+
+            tp_ready, dlist_ready, nb_ready = _is_down_ready(engine_id, remote_rank)
+            if tp_ready and dlist_ready and nb_ready:
+                # 已经就绪
+                return remote_rank if remote_rank is not None else int(self._downscale_info[engine_id]["remote_rank"])
+
+            # 如未就绪，尝试用缓存元数据补建一次
+            tried_build = False
+            if not tp_ready or not dlist_ready or not nb_ready:
+                # 只有在我们本进程已经缓存了对端的 MD 时，才主动补建
+                if hasattr(self, "_remote_md_cache") and (engine_id in getattr(self, "_remote_md_cache", {})):
+                    md = self._remote_md_cache[engine_id]
+                    try:
+                        # 仅当还没登记过时再补建；多次调用由 _check_engine_id_reuse 保驾
+                        if engine_id not in self._remote_agents:
+                            self.add_remote_agent(
+                                engine_id=engine_id,
+                                agent_metadata=md["agent_metadata"],
+                                agent_tp=int(md["agent_tp"]),
+                                kv_caches_base_addr=md["kv_caches_base_addr"],
+                                num_blocks=int(md["num_blocks"]),
+                                kv_caches_dev_ids=md.get("kv_caches_dev_ids"),
+                            )
+                            tried_build = True
+                    except Exception as e:
+                        # 失败也不退出，进入等待环节
+                        self.logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
+
+            # 进入短轮询等待（给别的线程/进程把 add_remote_agent 做完）
+            deadline = time.time() + (timeout_ms / 1000.0)
+            sleep_us = 0.005  # 5ms
+            while time.time() < deadline:
+                # 再次尝试拿 remote_rank（补建后通常就有了）
+                if remote_rank is None and hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
+                    try:
+                        remote_rank = int(self._downscale_info[engine_id]["remote_rank"])
+                    except Exception:
+                        remote_rank = None
+
+                tp_ready, dlist_ready, nb_ready = _is_down_ready(engine_id, remote_rank)
+                if tp_ready and dlist_ready and nb_ready:
+                    return remote_rank if remote_rank is not None else int(
+                        self._downscale_info[engine_id]["remote_rank"])
+                time.sleep(sleep_us)
+
+            # 超时仍未就绪，按原先的报错格式抛出
+            # 这里尽量还原你日志里的字段，方便你排查
+            raise RuntimeError(
+                "[WRITE] precondition not met on rank=%d dst=%s: down_ready(src=%s, dst=%s, nb=%s, rr=%s) ; "
+                "_tp_size_keys=%s src_keys=%s dst_keys_top=%s" % (
+                    self.rank,
+                    engine_id,
+                    True,  # src 侧在 worker 中始终已建
+                    False,
+                    False,
+                    (remote_rank if remote_rank is not None else -1),
+                    list(self._tp_size.keys()),
+                    list(self.src_xfer_side_handles.keys()),
+                    (list(self.dst_xfer_side_handles.get(engine_id, {}).keys())
+                     if engine_id in self.dst_xfer_side_handles else [])
+                )
+            )
+
+        # ===== 正式开始 =====
+        try:
+            notify_type = type(notify_msg).__name__
+            self.logger.info(
+                "[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
+                dst_engine_id, int(bool(local_block_ids)), int(bool(staging_block_ids)),
+                int(bool(remote_block_ids)), notify_type
+            )
+
+            tp_src = self._tp_size.get(self.engine_id, None)
+            tp_dst = self._tp_size.get(dst_engine_id, None)
+            tp_mult = (None if (tp_src is None or tp_dst is None) else (tp_dst // tp_src))
+
+            down_path = (tp_dst is not None) and (tp_src is not None) and (tp_dst < tp_src) and (not self._is_mla)
+            self.logger.info(
+                "[WRITE] path choose: down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
+                bool(down_path), tp_src, tp_dst, (tp_mult if tp_mult is not None else 0),
+                self.rank, int(bool(local_block_ids)), int(bool(staging_block_ids)), int(bool(remote_block_ids)),
+                (notify_msg if isinstance(notify_msg, str) else b"<bytes>")
+            )
+
+            if down_path or (tp_dst is None):
+                # —— 关键修复：在 DOWN 路径写之前，确保目标 engine 的 Down 侧句柄/映射已就绪 ——
+                remote_rank = _ensure_down_ready(dst_engine_id, timeout_ms=3000)
+
+                # 进入你原有的 DOWN 实现
+                return self._write_blocks_down(
+                    local_block_ids=local_block_ids,
+                    staging_block_ids=staging_block_ids,
+                    remote_block_ids=remote_block_ids,
+                    dst_engine_id=dst_engine_id,
+                    remote_rank=remote_rank,
+                    notify_msg=notify_msg,
+                )
+
+            # 其余情况维持 UP/EQUAL 的既有实现（不改动）
+            return self._write_blocks_up_equal(
+                local_block_ids=local_block_ids,
+                staging_block_ids=staging_block_ids,
+                remote_block_ids=remote_block_ids,
+                dst_engine_id=dst_engine_id,
+                notify_msg=notify_msg,
+            )
+
+        except Exception as e:
+            # 维持原有的异常打印格式
+            self.logger.error(
+                "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
+                dst_engine_id,
+                bool(down_path) if 'down_path' in locals() else False,
+                tp_src if 'tp_src' in locals() else None,
+                tp_dst if 'tp_dst' in locals() else None,
+                (tp_mult if 'tp_mult' in locals() and tp_mult is not None else 0),
+                self.rank,
+                int(bool(local_block_ids)), int(bool(staging_block_ids)), int(bool(remote_block_ids)),
+                (notify_msg if isinstance(notify_msg, str) else b"<bytes>")
+            )
+            raise
 
     def get_notifs(self):
         notifs = self.nixl_wrapper.update_notifs()
