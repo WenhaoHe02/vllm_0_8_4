@@ -687,6 +687,72 @@ class DynamoNixlConnector:
     def _peek(xs, k=3):
         return xs[:k] + (["..."] if len(xs) > k else [])
 
+    def _md_cache_dir(self) -> str:
+        d = os.getenv("NIXL_MD_CACHE_DIR")
+        if not d:
+            d = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _md_cache_path(self, engine_id: str) -> str:
+        safe_engine = self._sanitize_key(engine_id, 32)
+        return os.path.join(self._md_cache_dir(), f"nixl_md_{safe_engine}.msgpack")
+
+    def _persist_remote_md_cache(
+            self,
+            engine_id: str,
+            agent_metadata,
+            kv_caches_base_addr,
+            num_blocks: int,
+            kv_caches_dev_ids,
+            agent_tp: int,
+    ) -> None:
+        """把对端元数据写到本机共享缓存，供同机其它 rank 采纳。"""
+        try:
+            payload = {
+                "engine_id": engine_id,
+                "agent_tp": int(agent_tp),
+                "agent_metadata": agent_metadata,
+                "kv_caches_base_addr": kv_caches_base_addr,
+                "num_blocks": int(num_blocks),
+                "kv_caches_dev_ids": kv_caches_dev_ids,
+            }
+            b = msgspec.msgpack.encode(payload)
+            path = self._md_cache_path(engine_id)
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.write(b)
+            os.replace(tmp, path)  # 原子替换
+            logger.debug("[MD-CACHE] persisted for engine=%s path=%s size=%dB", engine_id, path, len(b))
+        except Exception as e:
+            logger.debug("[MD-CACHE] persist failed: %s", e)
+
+    def _adopt_remote_md_from_cache(self, engine_id: str) -> bool:
+        """如果还没拿到对端元数据，尝试从共享缓存读取并调用 add_remote_agent。"""
+        try:
+            path = self._md_cache_path(engine_id)
+            if not os.path.exists(path):
+                return False
+            with open(path, "rb") as f:
+                data = msgspec.msgpack.decode(f.read())
+            if data.get("engine_id") != engine_id:
+                return False
+            agent_tp = int(data["agent_tp"])
+            # 可能已就绪：再调一次也安全，内部有一致性检查
+            self.add_remote_agent(
+                engine_id=data["engine_id"],
+                agent_metadata=data["agent_metadata"],
+                agent_tp=agent_tp,
+                kv_caches_base_addr=data["kv_caches_base_addr"],
+                num_blocks=int(data["num_blocks"]),
+                kv_caches_dev_ids=data.get("kv_caches_dev_ids"),
+            )
+            logger.info("[MD-CACHE] adopted metadata for engine=%s", engine_id)
+            return True
+        except Exception as e:
+            logger.warning("[MD-CACHE] adopt failed for engine=%s: %s", engine_id, e)
+            return False
+
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         with self._timing.span("read_blocks"):
             logger.info("[READ] local=%s staging=%s remote=%s dst_engine=%s",
@@ -795,22 +861,18 @@ class DynamoNixlConnector:
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
-                # ---- 就绪检查（≤ NIXL_WRITE_RDY_MS 毫秒，默认 200ms）防止 KeyError/静默卡住 ----
+                # ---- 就绪检查（≤ NIXL_WRITE_RDY_MS，默认 200ms）+ 先尝试从共享缓存采纳 ----
                 import time as _t
                 WAIT_MS = int(os.getenv("NIXL_WRITE_RDY_MS", "200"))
                 deadline = _t.time() + WAIT_MS / 1000.0
 
                 def _ready_for(dst: str):
-                    # 1) TP 映射是否就绪
                     tp_dst = self._tp_size.get(dst, None)
                     tp_src = self._tp_size.get(self.engine_id, None)
                     if tp_dst is None or tp_src is None:
                         return False, "tp_size_missing"
                     tp_mult = tp_dst // max(1, tp_src)
-
-                    # 2) 路径所需句柄/信息是否齐全
                     if tp_mult == 0 and not self._is_mla:
-                        # down 路径：需要 downscale_info + 必要句柄
                         info = self._downscale_info.get(dst)
                         if info is None:
                             return False, "downscale_info_missing"
@@ -822,7 +884,6 @@ class DynamoNixlConnector:
                                 self.dst_xfer_side_handles[dst][rr] is None):
                             return False, f"dst_handle_down_missing(rr={rr})"
                     else:
-                        # up/equal 路径：检查对应 key 的句柄是否齐全
                         eff_tp = max(1, tp_mult)
                         if (eff_tp not in self.src_xfer_side_handles or
                                 self.src_xfer_side_handles[eff_tp] is None):
@@ -835,9 +896,17 @@ class DynamoNixlConnector:
                     return True, ""
 
                 ok, why = _ready_for(dst_engine_id)
+                # 先自愈：如果是 tp_size 缺失，尝试从共享缓存采纳一次
+                if not ok and why == "tp_size_missing":
+                    if self._adopt_remote_md_from_cache(dst_engine_id):
+                        ok, why = _ready_for(dst_engine_id)
+
                 while (not ok) and (_t.time() < deadline):
                     _t.sleep(0.001)
                     ok, why = _ready_for(dst_engine_id)
+                    if not ok and why == "tp_size_missing":
+                        # 等待期间只尝试一次 adopt 就够了；如需更激进可再次尝试
+                        pass
 
                 if not ok:
                     raise RuntimeError(
@@ -856,7 +925,6 @@ class DynamoNixlConnector:
 
                 # ---------- down 路径 ----------
                 if down is not None and (tp_multiplier == 0 and not self._is_mla):
-                    # 这里的强断言仍保留（按原逻辑），基本不应再触发
                     info = self._downscale_info[dst_engine_id]
                     remote_rank = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
@@ -882,7 +950,7 @@ class DynamoNixlConnector:
                             logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
-                # ---------- up/equal 路径（原逻辑保持不变） ----------
+                # ---------- up/equal 路径 ----------
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
 
@@ -1024,6 +1092,15 @@ class DynamoNixlConnector:
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
             self._tp_size[engine_id] = int(agent_tp)
+
+            self._persist_remote_md_cache(
+                engine_id=engine_id,
+                agent_metadata=agent_metadata,
+                kv_caches_base_addr=kv_caches_base_addr,
+                num_blocks=num_blocks,
+                kv_caches_dev_ids=kv_caches_dev_ids,
+                agent_tp=agent_tp,
+            )
 
             # 注册远端 agents（每个 engine 内部的 remote_rank: 0..agent_tp-1）
             agent_names: List[str] = []
