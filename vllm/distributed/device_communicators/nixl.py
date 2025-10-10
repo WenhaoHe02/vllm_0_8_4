@@ -931,7 +931,7 @@ class DynamoNixlConnector:
                             tried_build = True
                     except Exception as e:
                         # 失败也不退出，进入等待环节
-                        self.logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
+                        logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
 
             # 进入短轮询等待（给别的线程/进程把 add_remote_agent 做完）
             deadline = time.time() + (timeout_ms / 1000.0)
@@ -971,7 +971,7 @@ class DynamoNixlConnector:
         # ===== 正式开始 =====
         try:
             notify_type = type(notify_msg).__name__
-            self.logger.info(
+            logger.info(
                 "[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
                 dst_engine_id, int(bool(local_block_ids)), int(bool(staging_block_ids)),
                 int(bool(remote_block_ids)), notify_type
@@ -982,7 +982,7 @@ class DynamoNixlConnector:
             tp_mult = (None if (tp_src is None or tp_dst is None) else (tp_dst // tp_src))
 
             down_path = (tp_dst is not None) and (tp_src is not None) and (tp_dst < tp_src) and (not self._is_mla)
-            self.logger.info(
+            logger.info(
                 "[WRITE] path choose: down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
                 bool(down_path), tp_src, tp_dst, (tp_mult if tp_mult is not None else 0),
                 self.rank, int(bool(local_block_ids)), int(bool(staging_block_ids)), int(bool(remote_block_ids)),
@@ -1014,7 +1014,7 @@ class DynamoNixlConnector:
 
         except Exception as e:
             # 维持原有的异常打印格式
-            self.logger.error(
+            logger.error(
                 "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
                 dst_engine_id,
                 bool(down_path) if 'down_path' in locals() else False,
