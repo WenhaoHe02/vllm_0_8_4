@@ -958,7 +958,6 @@ class DynamoNixlConnector:
                 # 正确的 5 个位置参数调用
                 return self._write_blocks_down(
                     local_block_ids,
-                    staging_block_ids,
                     remote_block_ids,
                     dst_engine_id,
                     notify_msg,
