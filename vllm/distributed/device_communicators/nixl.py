@@ -856,75 +856,77 @@ class DynamoNixlConnector:
                             dst_engine_id, len(local_block_ids), len(staging_block_ids),
                             len(remote_block_ids), type(notify_msg).__name__)
 
+                # --- 长度一致性 ---
                 assert len(staging_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
-                # ---- 就绪检查（≤ NIXL_WRITE_RDY_MS，默认 200ms）+ 先尝试从共享缓存采纳 ----
-                import time as _t
-                WAIT_MS = int(os.getenv("NIXL_WRITE_RDY_MS", "200"))
-                deadline = _t.time() + WAIT_MS / 1000.0
+                # ===============================
+                #  就绪 GATING（有界自旋等待）
+                #  等待以下条件满足再进入真正的写：
+                #   - DOWN 路径：已有 self._downscale_info[dst]，
+                #                src 句柄 key=1、dst 句柄 key=(dst_engine_id, remote_rank) 都就绪，
+                #                且记录了 dst_num_blocks[dst]
+                #   - UP/EQ 路径：已有 _tp_size[dst]，可算出 tp_multiplier，
+                #                src 句柄 key=tp_multiplier、dst 句柄 key=i (0..eff_tp-1) 全部就绪，
+                #                且记录了 dst_num_blocks[dst]
+                #  超时（默认 3000ms，可用 NIXL_READY_WAIT_MS 覆盖）则报错
+                # ===============================
+                wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
+                t0 = time.time()
+                last_missing = "unknown"
+                while True:
+                    # 优先判定 DOWN：add_remote_agent 完成后会先填 _downscale_info
+                    info = self._downscale_info.get(dst_engine_id)
+                    if info is not None:
+                        remote_rank = info.get("remote_rank")
+                        src_ok = (1 in self.src_xfer_side_handles
+                                  and self.src_xfer_side_handles[1] is not None)
+                        dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
+                                  remote_rank in self.dst_xfer_side_handles[dst_engine_id] and
+                                  self.dst_xfer_side_handles[dst_engine_id][remote_rank] is not None)
+                        nb_ok = (dst_engine_id in self.dst_num_blocks)
+                        if src_ok and dst_ok and nb_ok:
+                            break  # DOWN 路径就绪
+                        last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={remote_rank})"
 
-                def _ready_for(dst: str):
-                    tp_dst = self._tp_size.get(dst, None)
-                    tp_src = self._tp_size.get(self.engine_id, None)
-                    if tp_dst is None or tp_src is None:
-                        return False, "tp_size_missing"
-                    tp_mult = tp_dst // max(1, tp_src)
-                    if tp_mult == 0 and not self._is_mla:
-                        info = self._downscale_info.get(dst)
-                        if info is None:
-                            return False, "downscale_info_missing"
-                        if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                            return False, "src_handle_down_missing"
-                        rr = info.get("remote_rank", None)
-                        if (dst not in self.dst_xfer_side_handles or
-                                rr not in self.dst_xfer_side_handles[dst] or
-                                self.dst_xfer_side_handles[dst][rr] is None):
-                            return False, f"dst_handle_down_missing(rr={rr})"
                     else:
-                        eff_tp = max(1, tp_mult)
-                        if (eff_tp not in self.src_xfer_side_handles or
-                                self.src_xfer_side_handles[eff_tp] is None):
-                            return False, f"src_handle_up_missing(key={eff_tp})"
-                        if dst not in self.dst_xfer_side_handles:
-                            return False, "dst_handles_up_missing"
-                        for i in range(eff_tp):
-                            if i not in self.dst_xfer_side_handles[dst] or self.dst_xfer_side_handles[dst][i] is None:
-                                return False, f"dst_handle_up_missing(i={i})"
-                    return True, ""
+                        # 尝试判定 UP/EQ：要求 _tp_size 有 dst & 本端，且句柄齐
+                        tp_dst = self._tp_size.get(dst_engine_id)
+                        tp_src = self._tp_size.get(self.engine_id)
+                        if tp_dst is not None and tp_src is not None and tp_src > 0:
+                            tp_multiplier = tp_dst // tp_src
+                            eff_tp = max(1, tp_multiplier) if tp_multiplier is not None else 1
+                            src_ok = (tp_multiplier in self.src_xfer_side_handles
+                                      and self.src_xfer_side_handles[tp_multiplier] is not None)
+                            dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
+                            dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
+                            nb_ok = (dst_engine_id in self.dst_num_blocks)
+                            if tp_multiplier is not None and tp_multiplier >= 1 and src_ok and dst_ok and nb_ok:
+                                break  # UP/EQ 路径就绪
+                            last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
+                                            f"tp_mult={tp_multiplier}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
+                        else:
+                            last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
 
-                ok, why = _ready_for(dst_engine_id)
-                # 先自愈：如果是 tp_size 缺失，尝试从共享缓存采纳一次
-                if not ok and why == "tp_size_missing":
-                    if self._adopt_remote_md_from_cache(dst_engine_id):
-                        ok, why = _ready_for(dst_engine_id)
+                    if (time.time() - t0) * 1000.0 > wait_ms:
+                        raise RuntimeError(
+                            f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
+                            f"_tp_size_keys={list(self._tp_size.keys())} src_keys={list(self.src_xfer_side_handles.keys())} "
+                            f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
+                        )
+                    # 轻量退避
+                    time.sleep(0.001)
 
-                while (not ok) and (_t.time() < deadline):
-                    _t.sleep(0.001)
-                    ok, why = _ready_for(dst_engine_id)
-                    if not ok and why == "tp_size_missing":
-                        # 等待期间只尝试一次 adopt 就够了；如需更激进可再次尝试
-                        pass
-
-                if not ok:
-                    raise RuntimeError(
-                        f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {why} ; "
-                        f"_tp_size_keys={list(self._tp_size.keys())} "
-                        f"src_keys={list(self.src_xfer_side_handles.keys())} "
-                        f"dst_keys_top={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}"
-                    )
-
-                # 就绪后再读取分支条件与 tp_multiplier
+                # --- 真正分支逻辑 ---
                 down = self._downscale_info.get(dst_engine_id)
-                tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
 
                 def _to_notify_str(x):
                     return x if isinstance(x, str) else str(x)
 
-                # ---------- down 路径 ----------
-                if down is not None and (tp_multiplier == 0 and not self._is_mla):
+                if down is not None:
+                    # 再做一次快速断言，日志更清晰
                     info = self._downscale_info[dst_engine_id]
                     remote_rank = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
@@ -950,7 +952,8 @@ class DynamoNixlConnector:
                             logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
-                # ---------- up/equal 路径 ----------
+                # ===== UP / EQ 路径 =====
+                tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
 
@@ -989,7 +992,7 @@ class DynamoNixlConnector:
                                 )
 
                 remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
-                local_handle = self.src_xfer_side_handles[eff_tp]
+                local_handle = self.src_xfer_side_handles[tp_multiplier]
                 created, handles = 0, []
 
                 notify_payload_str = _to_notify_str(notify_msg)
@@ -1031,7 +1034,7 @@ class DynamoNixlConnector:
                             raise RuntimeError(f"[WRITE] transfer failed with state {st}")
                     pending = nxt
                     if pending:
-                        _t.sleep(0.001)
+                        time.sleep(0.001)
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
 
                 if self._timing_autolog:
