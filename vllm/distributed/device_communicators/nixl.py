@@ -1013,61 +1013,74 @@ class DynamoNixlConnector:
 
     def _ensure_engine_ready_for(self, dst_engine_id: str, wait_ms: int) -> None:
         """
-        在 write_blocks 真正开传之前，尝试让“本 rank 对 dst_engine”的
-        - tp_size
-        - dlist 句柄（DOWN: src key=1, dst key=(dst_engine_id, remote_rank)；
-                      UP/EQ: src key=tp_mult, dst key=i）
-        - dst_num_blocks
-        全部就绪。必要时从本机共享缓存 adopt（会在本 rank 直接调用 add_remote_agent）。
+        目标：在 write 前确保本 rank 对 dst 的就绪。
+        改动点：只要“未就绪”，就尝试 adopt（而不是仅在 _tp_size[dst] 缺失时）。
+        adopt 会从本机缓存拉远端 meta，并在本 rank 立即调用 add_remote_agent，
+        从而把 DOWN/UP 所需句柄和 dst_num_blocks 都建好。
         """
         t0 = time.time()
-        tried_adopt = False
+        adopt_attempts = 0
+        last_missing = "unknown"
+
+        def _down_ready_state():
+            info = self._downscale_info.get(dst_engine_id)
+            if info is None:
+                return False, "down_info=None"
+            rr = info.get("remote_rank")
+            src_ok = (1 in self.src_xfer_side_handles and self.src_xfer_side_handles[1] is not None)
+            dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
+                      rr in self.dst_xfer_side_handles[dst_engine_id] and
+                      self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
+            nb_ok = (dst_engine_id in self.dst_num_blocks)
+            ready = (src_ok and dst_ok and nb_ok)
+            miss = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
+            return ready, miss
+
+        def _up_ready_state():
+            tp_dst = self._tp_size.get(dst_engine_id)
+            tp_src = self._tp_size.get(self.engine_id)
+            if tp_dst is None or tp_src is None or tp_src <= 0:
+                return False, f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
+            tp_mult = tp_dst // tp_src
+            eff_tp = max(1, tp_mult)
+            src_ok = (tp_mult in self.src_xfer_side_handles and
+                      self.src_xfer_side_handles[tp_mult] is not None)
+            dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
+            dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
+            nb_ok = (dst_engine_id in self.dst_num_blocks)
+            ready = (tp_mult >= 1 and src_ok and dst_ok and nb_ok)
+            miss = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, tp_mult={tp_mult}, "
+                    f"src={src_ok}, dst={dst_ok}, nb={nb_ok})")
+            return ready, miss
 
         while True:
-            # 如果还没见过这个 engine，先尝试 adopt（只做一次，避免频繁 IO）
-            if dst_engine_id not in self._tp_size and not tried_adopt:
-                tried_adopt = True
-                try:
-                    adopted = False
-                    if hasattr(self, "_adopt_remote_md_from_cache"):
-                        adopted = self._adopt_remote_md_from_cache(dst_engine_id)
-                    if adopted:
-                        logger.info("[READY] adopted metadata for engine=%s in write path", dst_engine_id)
-                except Exception as e:
-                    logger.warning("[READY] adopt failed engine=%s: %s", dst_engine_id, e)
+            # 优先判定 DOWN（add_remote_agent(tp_mult==0) 会设置 _downscale_info）
+            down_ready, down_miss = _down_ready_state()
+            if down_ready:
+                return
 
-            down_info = self._downscale_info.get(dst_engine_id)
-            if down_info is not None:
-                # DOWN 路径：需要 src key=1、dst key=(dst_engine_id, remote_rank)、dst_num_blocks
-                rr = down_info.get("remote_rank")
-                src_ok = (1 in self.src_xfer_side_handles and self.src_xfer_side_handles[1] is not None)
-                dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
-                          rr in self.dst_xfer_side_handles[dst_engine_id] and
-                          self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
-                nb_ok = (dst_engine_id in self.dst_num_blocks)
-                if src_ok and dst_ok and nb_ok:
-                    return
-                last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
+            # 若不是 DOWN，试一下 UP/EQ
+            up_ready, up_miss = _up_ready_state()
+            if up_ready:
+                return
 
-            else:
-                # UP/EQ 路径：需要 tp_size 两端、src key=tp_mult、dst key=0..eff_tp-1、dst_num_blocks
-                tp_dst = self._tp_size.get(dst_engine_id)
-                tp_src = self._tp_size.get(self.engine_id)
-                if tp_dst is not None and tp_src is not None and tp_src > 0:
-                    tp_mult = tp_dst // tp_src
-                    eff_tp = max(1, tp_mult)
-                    src_ok = (tp_mult in self.src_xfer_side_handles and
-                              self.src_xfer_side_handles[tp_mult] is not None)
-                    dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
-                    dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
-                    nb_ok = (dst_engine_id in self.dst_num_blocks)
-                    if tp_mult >= 1 and src_ok and dst_ok and nb_ok:
-                        return
-                    last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, tp_mult={tp_mult}, "
-                                    f"src={src_ok}, dst={dst_ok}, nb={nb_ok})")
-                else:
-                    last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
+            # 走到这里说明“未就绪”，记录缺失原因
+            last_missing = down_miss if self._downscale_info.get(dst_engine_id) is not None else up_miss
 
+            # —— 关键改动：不论 _tp_size 是否已存在，只要未就绪就尝试 adopt —— #
+            adopted = False
+            try:
+                if hasattr(self, "_adopt_remote_md_from_cache"):
+                    adopted = self._adopt_remote_md_from_cache(dst_engine_id)
+            except Exception as e:
+                logger.warning("[READY] adopt failed engine=%s: %s", dst_engine_id, e)
+            if adopted:
+                adopt_attempts += 1
+                logger.info("[READY] adopt success engine=%s (attempt=%d)", dst_engine_id, adopt_attempts)
+                # 成功 adopt 后立即重判
+                continue
+
+            # 超时控制
             if (time.time() - t0) * 1000.0 > wait_ms:
                 raise RuntimeError(
                     f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
@@ -1075,6 +1088,7 @@ class DynamoNixlConnector:
                     f"src_keys={list(self.src_xfer_side_handles.keys())} "
                     f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
                 )
+
             time.sleep(0.001)
 
     def add_remote_agent(
