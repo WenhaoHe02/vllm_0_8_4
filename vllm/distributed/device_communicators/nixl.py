@@ -874,7 +874,6 @@ class DynamoNixlConnector:
             """
             tp_ready = engine_id in self._tp_size
             if remote_rank is None:
-                # 还没建立 downscale_info 就没有 remote_rank，先看 top-level 容器是否存在
                 d_top = engine_id in self.dst_xfer_side_handles
                 dlist_ready = False
             else:
@@ -898,7 +897,6 @@ class DynamoNixlConnector:
             2) 否则做短轮询等待（给并行的 add_remote_nixl_metadata 时间）。
             返回 remote_rank（从 self._downscale_info 取）。
             """
-            # 尝试直接拿 remote_rank（可能尚未有）
             remote_rank = None
             if hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
                 try:
@@ -908,36 +906,28 @@ class DynamoNixlConnector:
 
             tp_ready, dlist_ready, nb_ready = _is_down_ready(engine_id, remote_rank)
             if tp_ready and dlist_ready and nb_ready:
-                # 已经就绪
                 return remote_rank if remote_rank is not None else int(self._downscale_info[engine_id]["remote_rank"])
 
-            # 如未就绪，尝试用缓存元数据补建一次
-            tried_build = False
-            if not tp_ready or not dlist_ready or not nb_ready:
-                # 只有在我们本进程已经缓存了对端的 MD 时，才主动补建
-                if hasattr(self, "_remote_md_cache") and (engine_id in getattr(self, "_remote_md_cache", {})):
-                    md = self._remote_md_cache[engine_id]
-                    try:
-                        # 仅当还没登记过时再补建；多次调用由 _check_engine_id_reuse 保驾
-                        if engine_id not in self._remote_agents:
-                            self.add_remote_agent(
-                                engine_id=engine_id,
-                                agent_metadata=md["agent_metadata"],
-                                agent_tp=int(md["agent_tp"]),
-                                kv_caches_base_addr=md["kv_caches_base_addr"],
-                                num_blocks=int(md["num_blocks"]),
-                                kv_caches_dev_ids=md.get("kv_caches_dev_ids"),
-                            )
-                            tried_build = True
-                    except Exception as e:
-                        # 失败也不退出，进入等待环节
-                        logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
+            # 未就绪，且本地有缓存则尝试补建（幂等，由 _check_engine_id_reuse 兜底）
+            if hasattr(self, "_remote_md_cache") and (engine_id in getattr(self, "_remote_md_cache", {})):
+                md = self._remote_md_cache[engine_id]
+                try:
+                    if engine_id not in self._remote_agents:
+                        self.add_remote_agent(
+                            engine_id=engine_id,
+                            agent_metadata=md["agent_metadata"],
+                            agent_tp=int(md["agent_tp"]),
+                            kv_caches_base_addr=md["kv_caches_base_addr"],
+                            num_blocks=int(md["num_blocks"]),
+                            kv_caches_dev_ids=md.get("kv_caches_dev_ids"),
+                        )
+                except Exception as e:
+                    logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
 
-            # 进入短轮询等待（给别的线程/进程把 add_remote_agent 做完）
+            # 短轮询等待
             deadline = time.time() + (timeout_ms / 1000.0)
-            sleep_us = 0.005  # 5ms
+            sleep_s = 0.005  # 5ms
             while time.time() < deadline:
-                # 再次尝试拿 remote_rank（补建后通常就有了）
                 if remote_rank is None and hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
                     try:
                         remote_rank = int(self._downscale_info[engine_id]["remote_rank"])
@@ -948,16 +938,15 @@ class DynamoNixlConnector:
                 if tp_ready and dlist_ready and nb_ready:
                     return remote_rank if remote_rank is not None else int(
                         self._downscale_info[engine_id]["remote_rank"])
-                time.sleep(sleep_us)
+                time.sleep(sleep_s)
 
-            # 超时仍未就绪，按原先的报错格式抛出
-            # 这里尽量还原你日志里的字段，方便你排查
+            # 超时仍未就绪，按原先日志风格抛错
             raise RuntimeError(
                 "[WRITE] precondition not met on rank=%d dst=%s: down_ready(src=%s, dst=%s, nb=%s, rr=%s) ; "
                 "_tp_size_keys=%s src_keys=%s dst_keys_top=%s" % (
                     self.rank,
                     engine_id,
-                    True,  # src 侧在 worker 中始终已建
+                    True,
                     False,
                     False,
                     (remote_rank if remote_rank is not None else -1),
@@ -990,30 +979,29 @@ class DynamoNixlConnector:
             )
 
             if down_path or (tp_dst is None):
-                # —— 关键修复：在 DOWN 路径写之前，确保目标 engine 的 Down 侧句柄/映射已就绪 ——
+                # —— 关键修复：在 DOWN 写前，确保目标 engine 的 Down 侧句柄/映射已就绪 ——
                 remote_rank = _ensure_down_ready(dst_engine_id, timeout_ms=3000)
 
-                # 进入你原有的 DOWN 实现
+                # 进入你原有的 DOWN 实现 —— 按**位置参数**传递
                 return self._write_blocks_down(
-                    local_block_ids=local_block_ids,
-                    staging_block_ids=staging_block_ids,
-                    remote_block_ids=remote_block_ids,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                    notify_msg=notify_msg,
+                    local_block_ids,
+                    staging_block_ids,
+                    remote_block_ids,
+                    dst_engine_id,
+                    remote_rank,
+                    notify_msg,
                 )
 
-            # 其余情况维持 UP/EQUAL 的既有实现（不改动）
+            # 其余情况维持 UP/EQUAL 的既有实现（同样用**位置参数**）
             return self._write_blocks_up_equal(
-                local_block_ids=local_block_ids,
-                staging_block_ids=staging_block_ids,
-                remote_block_ids=remote_block_ids,
-                dst_engine_id=dst_engine_id,
-                notify_msg=notify_msg,
+                local_block_ids,
+                staging_block_ids,
+                remote_block_ids,
+                dst_engine_id,
+                notify_msg,
             )
 
         except Exception as e:
-            # 维持原有的异常打印格式
             logger.error(
                 "[WRITE] exception dst=%s down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
                 dst_engine_id,
