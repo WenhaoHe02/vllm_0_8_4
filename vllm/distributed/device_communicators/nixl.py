@@ -858,89 +858,62 @@ class DynamoNixlConnector:
             notify_msg,  # bytes or str
     ):
         """
-        统一写 KV 的入口。仅对 DOWN 路径增加就绪闸门，避免在目标 engine 尚未完成 add_remote_agent()
+        统一写 KV 的入口。
+        仅对 DOWN 路径增加就绪闸门，避免在目标 engine 尚未完成 add_remote_agent()
         以及 dlist 准备前就发起写，造成 precondition 报错。
         """
 
         import time
-        from typing import Optional
 
-        def _is_down_ready(engine_id: str, remote_rank: Optional[int]) -> tuple[bool, bool, bool]:
-            """
-            返回 (tp_ready, dlist_ready, nb_ready)
-            - tp_ready: 目标 tp_size 是否就绪（即 add_remote_agent 至少跑过一遍）
-            - dlist_ready: 目标 engine 的 down 路径 dlist 是否就绪（含 remote_rank 的 token/块 两套句柄）
-            - nb_ready: 记录的 num_blocks_read 是否就绪
-            """
-            tp_ready = engine_id in self._tp_size
-            if remote_rank is None:
-                d_top = engine_id in self.dst_xfer_side_handles
-                dlist_ready = False
-            else:
-                d_top = engine_id in self.dst_xfer_side_handles
-                dlist_ready = (
-                        d_top and
-                        (remote_rank in self.dst_xfer_side_handles[engine_id]) and
-                        ("read_down_dst" in self.dst_xfer_side_handles[engine_id])
-                )
-            nb_ready = (
-                    hasattr(self, "dst_num_blocks_read")
-                    and isinstance(self.dst_num_blocks_read, dict)
-                    and (engine_id in self.dst_num_blocks_read)
-            )
-            return tp_ready, dlist_ready, nb_ready
+        def _down_ready(engine_id: str) -> bool:
+            # 是否已有 tp_size、downscale_info、dlist 与 num_blocks_read
+            if engine_id not in self._tp_size:
+                return False
+            if not hasattr(self, "_downscale_info") or engine_id not in self._downscale_info:
+                return False
+            di = self._downscale_info[engine_id]
+            rr = di.get("remote_rank", None)
+            if rr is None:
+                return False
+            # 目的 dlist（token 粒度的 dst_xfer_side_handles[engine_id][remote_rank]）与 read_down_dst
+            if engine_id not in self.dst_xfer_side_handles:
+                return False
+            if rr not in self.dst_xfer_side_handles[engine_id]:
+                return False
+            if "read_down_dst" not in self.dst_xfer_side_handles[engine_id]:
+                return False
+            # 目的 num_blocks_read
+            if not hasattr(self, "dst_num_blocks_read") or engine_id not in self.dst_num_blocks_read:
+                return False
+            return True
 
-        def _ensure_down_ready(engine_id: str, timeout_ms: int = 3000) -> int:
-            """
-            确保 DOWN 路径就绪：
-            1) 如未就绪且本进程有缓存的远端元数据，则同步调用 add_remote_agent() 补建；
-            2) 否则做短轮询等待（给并行的 add_remote_nixl_metadata 时间）。
-            返回 remote_rank（从 self._downscale_info 取）。
-            """
-            remote_rank = None
-            if hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
+        def _ensure_down_ready(engine_id: str, timeout_ms: int = 3000) -> None:
+            if _down_ready(engine_id):
+                return
+            # 若本地缓存了对端 MD，尝试一次幂等补建
+            md_cache = getattr(self, "_remote_md_cache", {})
+            if engine_id in md_cache and engine_id not in getattr(self, "_remote_agents", {}):
+                md = md_cache[engine_id]
                 try:
-                    remote_rank = int(self._downscale_info[engine_id]["remote_rank"])
-                except Exception:
-                    remote_rank = None
-
-            tp_ready, dlist_ready, nb_ready = _is_down_ready(engine_id, remote_rank)
-            if tp_ready and dlist_ready and nb_ready:
-                return remote_rank if remote_rank is not None else int(self._downscale_info[engine_id]["remote_rank"])
-
-            # 未就绪，且本地有缓存则尝试补建（幂等，由 _check_engine_id_reuse 兜底）
-            if hasattr(self, "_remote_md_cache") and (engine_id in getattr(self, "_remote_md_cache", {})):
-                md = self._remote_md_cache[engine_id]
-                try:
-                    if engine_id not in self._remote_agents:
-                        self.add_remote_agent(
-                            engine_id=engine_id,
-                            agent_metadata=md["agent_metadata"],
-                            agent_tp=int(md["agent_tp"]),
-                            kv_caches_base_addr=md["kv_caches_base_addr"],
-                            num_blocks=int(md["num_blocks"]),
-                            kv_caches_dev_ids=md.get("kv_caches_dev_ids"),
-                        )
+                    self.add_remote_agent(
+                        engine_id=engine_id,
+                        agent_metadata=md["agent_metadata"],
+                        agent_tp=int(md["agent_tp"]),
+                        kv_caches_base_addr=md["kv_caches_base_addr"],
+                        num_blocks=int(md["num_blocks"]),
+                        kv_caches_dev_ids=md.get("kv_caches_dev_ids"),
+                    )
                 except Exception as e:
-                    logger.debug("[WRITE][DOWN] try add_remote_agent from cache failed: %s", e)
+                    logger.debug("[WRITE][DOWN] add_remote_agent-from-cache failed: %s", e)
 
-            # 短轮询等待
-            deadline = time.time() + (timeout_ms / 1000.0)
-            sleep_s = 0.005  # 5ms
+            # 短轮询等待另一侧建好
+            deadline = time.time() + timeout_ms / 1000.0
             while time.time() < deadline:
-                if remote_rank is None and hasattr(self, "_downscale_info") and (engine_id in self._downscale_info):
-                    try:
-                        remote_rank = int(self._downscale_info[engine_id]["remote_rank"])
-                    except Exception:
-                        remote_rank = None
+                if _down_ready(engine_id):
+                    return
+                time.sleep(0.005)
 
-                tp_ready, dlist_ready, nb_ready = _is_down_ready(engine_id, remote_rank)
-                if tp_ready and dlist_ready and nb_ready:
-                    return remote_rank if remote_rank is not None else int(
-                        self._downscale_info[engine_id]["remote_rank"])
-                time.sleep(sleep_s)
-
-            # 超时仍未就绪，按原先日志风格抛错
+            # 仍未就绪——保持原样式报错，方便对齐日志检查
             raise RuntimeError(
                 "[WRITE] precondition not met on rank=%d dst=%s: down_ready(src=%s, dst=%s, nb=%s, rr=%s) ; "
                 "_tp_size_keys=%s src_keys=%s dst_keys_top=%s" % (
@@ -949,7 +922,8 @@ class DynamoNixlConnector:
                     True,
                     False,
                     False,
-                    (remote_rank if remote_rank is not None else -1),
+                    (getattr(self._downscale_info.get(engine_id, {}), "get", lambda *_: None)("remote_rank") if hasattr(
+                        self, "_downscale_info") else None),
                     list(self._tp_size.keys()),
                     list(self.src_xfer_side_handles.keys()),
                     (list(self.dst_xfer_side_handles.get(engine_id, {}).keys())
@@ -957,7 +931,6 @@ class DynamoNixlConnector:
                 )
             )
 
-        # ===== 正式开始 =====
         try:
             notify_type = type(notify_msg).__name__
             logger.info(
@@ -969,8 +942,8 @@ class DynamoNixlConnector:
             tp_src = self._tp_size.get(self.engine_id, None)
             tp_dst = self._tp_size.get(dst_engine_id, None)
             tp_mult = (None if (tp_src is None or tp_dst is None) else (tp_dst // tp_src))
-
             down_path = (tp_dst is not None) and (tp_src is not None) and (tp_dst < tp_src) and (not self._is_mla)
+
             logger.info(
                 "[WRITE] path choose: down=%s tp_src=%s tp_dst=%s tp_mult=%s rank=%d local=%d staging=%d remote=%d notify_repr=%r",
                 bool(down_path), tp_src, tp_dst, (tp_mult if tp_mult is not None else 0),
@@ -979,20 +952,19 @@ class DynamoNixlConnector:
             )
 
             if down_path or (tp_dst is None):
-                # —— 关键修复：在 DOWN 写前，确保目标 engine 的 Down 侧句柄/映射已就绪 ——
-                remote_rank = _ensure_down_ready(dst_engine_id, timeout_ms=3000)
+                # —— 关键：确保 Down 侧映射/句柄已建好（remote_rank 由 add_remote_agent 写入内部状态，不从这里传参）——
+                _ensure_down_ready(dst_engine_id, timeout_ms=3000)
 
-                # 进入你原有的 DOWN 实现 —— 按**位置参数**传递
+                # 正确的 5 个位置参数调用
                 return self._write_blocks_down(
                     local_block_ids,
                     staging_block_ids,
                     remote_block_ids,
                     dst_engine_id,
-                    remote_rank,
                     notify_msg,
                 )
 
-            # 其余情况维持 UP/EQUAL 的既有实现（同样用**位置参数**）
+            # UP/EQ：同样用 5 个位置参数
             return self._write_blocks_up_equal(
                 local_block_ids,
                 staging_block_ids,
@@ -1008,7 +980,7 @@ class DynamoNixlConnector:
                 bool(down_path) if 'down_path' in locals() else False,
                 tp_src if 'tp_src' in locals() else None,
                 tp_dst if 'tp_dst' in locals() else None,
-                (tp_mult if 'tp_mult' in locals() and tp_mult is not None else 0),
+                (tp_mult if ('tp_mult' in locals() and tp_mult is not None) else 0),
                 self.rank,
                 int(bool(local_block_ids)), int(bool(staging_block_ids)), int(bool(remote_block_ids)),
                 (notify_msg if isinstance(notify_msg, str) else b"<bytes>")
