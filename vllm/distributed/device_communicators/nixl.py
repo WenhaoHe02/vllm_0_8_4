@@ -1011,21 +1011,75 @@ class DynamoNixlConnector:
     def get_new_notifs(self):
         return self.nixl_wrapper.get_new_notifs()
 
+    def _rebuild_down_dst_handle(self, dst_engine_id: str, remote_rank: int) -> None:
+        info = self._downscale_info.get(dst_engine_id)
+        assert info is not None, "[REPAIR] downscale info missing"
+        group_size = int(info["group_size"])
+        peer_idx = int(info["peer_idx"])
+
+        B = int(self.block_size)
+        token_len_local = self.block_len // B
+        token_len_total = token_len_local * group_size
+        full_len = token_len_total * B
+        peer_off_tok = peer_idx * token_len_local
+
+        # 选设备 id：优先用 kv_caches_dev_ids，其次用你原来的 engine->gpu 映射
+        def _remote_dev_id(r_engine_id, r_idx, layer, entry_idx):
+            devs = self.kv_caches_dev_ids.get(r_engine_id)
+            if devs is not None:
+                return int(devs[r_idx][layer][entry_idx])
+            # 回退：保持和 add_remote_agent 相同的映射策略
+            if not hasattr(self, "_engine_gpu_map") or r_engine_id not in self._engine_gpu_map:
+                # 默认放到 0（或你环境变量里的池），避免 KeyError
+                g = int(os.getenv("NIXL_REPAIR_DEFAULT_GPU", "0"))
+                if not hasattr(self, "_engine_gpu_map"):
+                    self._engine_gpu_map = {}
+                self._engine_gpu_map[r_engine_id] = g
+            return int(self._engine_gpu_map[r_engine_id])
+
+        # 重新拼装 dst token 粒度的块描述
+        dst_blocks = []
+        num_blocks = self.dst_num_blocks_read.get(dst_engine_id)  # 注意：READ 用块计数
+        if num_blocks is None:
+            # 回退：用 tokens 对齐的总单位换回块数（按 B）
+            tokens_total = self.dst_num_blocks.get(dst_engine_id)
+            assert tokens_total is not None, "[REPAIR] dst units missing"
+            num_blocks = tokens_total // B
+
+        for layer in range(self.num_layers):
+            layer_bases = self.kv_caches_base_addr[dst_engine_id][remote_rank][layer]
+            for entry_idx, rbase in enumerate(layer_bases):  # K / V
+                rdev = _remote_dev_id(dst_engine_id, remote_rank, layer, entry_idx)
+                for bid in range(num_blocks):
+                    base_block = rbase + bid * full_len
+                    for t in range(B):
+                        dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
+                                           token_len_local, rdev))
+
+        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+        h = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[dst_engine_id][remote_rank], dst_desc)
+
+        if dst_engine_id not in self.dst_xfer_side_handles:
+            self.dst_xfer_side_handles[dst_engine_id] = {}
+        self.dst_xfer_side_handles[dst_engine_id][remote_rank] = h
+
+        try:
+            self.nixl_wrapper.make_connection(self._remote_agents[dst_engine_id][remote_rank])
+        except Exception:
+            pass
+
+        logger.info("[READY][REPAIR] dst handle rebuilt engine=%s rr=%d", dst_engine_id, remote_rank)
+
+
     def _ensure_engine_ready_for(self, dst_engine_id: str, wait_ms: int) -> None:
-        """
-        目标：在 write 前确保本 rank 对 dst 的就绪。
-        改动点：只要“未就绪”，就尝试 adopt（而不是仅在 _tp_size[dst] 缺失时）。
-        adopt 会从本机缓存拉远端 meta，并在本 rank 立即调用 add_remote_agent，
-        从而把 DOWN/UP 所需句柄和 dst_num_blocks 都建好。
-        """
         t0 = time.time()
         adopt_attempts = 0
         last_missing = "unknown"
 
-        def _down_ready_state():
+        def _down_state():
             info = self._downscale_info.get(dst_engine_id)
             if info is None:
-                return False, "down_info=None"
+                return False, "down_info=None", None
             rr = info.get("remote_rank")
             src_ok = (1 in self.src_xfer_side_handles and self.src_xfer_side_handles[1] is not None)
             dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
@@ -1034,9 +1088,9 @@ class DynamoNixlConnector:
             nb_ok = (dst_engine_id in self.dst_num_blocks)
             ready = (src_ok and dst_ok and nb_ok)
             miss = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
-            return ready, miss
+            return ready, miss, rr
 
-        def _up_ready_state():
+        def _up_state():
             tp_dst = self._tp_size.get(dst_engine_id)
             tp_src = self._tp_size.get(self.engine_id)
             if tp_dst is None or tp_src is None or tp_src <= 0:
@@ -1054,20 +1108,37 @@ class DynamoNixlConnector:
             return ready, miss
 
         while True:
-            # 优先判定 DOWN（add_remote_agent(tp_mult==0) 会设置 _downscale_info）
-            down_ready, down_miss = _down_ready_state()
+            down_ready, down_miss, rr = _down_state()
             if down_ready:
                 return
 
-            # 若不是 DOWN，试一下 UP/EQ
-            up_ready, up_miss = _up_ready_state()
+            # *** REPAIR: 有 info 但缺 dst 句柄 —— 直接重建这一条句柄 ***
+            if self._downscale_info.get(dst_engine_id) is not None and rr is not None:
+                dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
+                          rr in self.dst_xfer_side_handles[dst_engine_id] and
+                          self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
+                if not dst_ok:
+                    try:
+                        self._rebuild_down_dst_handle(dst_engine_id, rr)
+                        # 重建成功后立刻复查
+                        continue
+                    except Exception as e:
+                        # 当前 info 可能脏了，清理后交给 adopt
+                        logger.warning(
+                            "[READY][REPAIR] rebuild dst handle failed engine=%s rr=%s: %s ; purge info and retry adopt",
+                            dst_engine_id, rr, e)
+                        try:
+                            self._downscale_info.pop(dst_engine_id, None)
+                        except Exception:
+                            pass
+
+            up_ready, up_miss = _up_state()
             if up_ready:
                 return
 
-            # 走到这里说明“未就绪”，记录缺失原因
             last_missing = down_miss if self._downscale_info.get(dst_engine_id) is not None else up_miss
 
-            # —— 关键改动：不论 _tp_size 是否已存在，只要未就绪就尝试 adopt —— #
+            # 未就绪 => 尝试 adopt（不管 _tp_size 是否已存在）
             adopted = False
             try:
                 if hasattr(self, "_adopt_remote_md_from_cache"):
@@ -1077,10 +1148,8 @@ class DynamoNixlConnector:
             if adopted:
                 adopt_attempts += 1
                 logger.info("[READY] adopt success engine=%s (attempt=%d)", dst_engine_id, adopt_attempts)
-                # 成功 adopt 后立即重判
                 continue
 
-            # 超时控制
             if (time.time() - t0) * 1000.0 > wait_ms:
                 raise RuntimeError(
                     f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
@@ -1088,7 +1157,6 @@ class DynamoNixlConnector:
                     f"src_keys={list(self.src_xfer_side_handles.keys())} "
                     f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
                 )
-
             time.sleep(0.001)
 
     def add_remote_agent(
