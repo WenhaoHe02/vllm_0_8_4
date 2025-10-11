@@ -453,57 +453,6 @@ class DynamoNixlConnector:
         os.makedirs(d, exist_ok=True)
         return d
 
-    def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: str,
-                               group_size: int, peer_idx: int, is_leader: bool) -> None:
-        """
-        组内 barrier（仅 leader 等全员）。新增两个行为：
-        - NIXL_DOWN_BARRIER=0 时直接短路（用于快速定位/绕过）。
-        - NIXL_DOWN_WAIT_MS 超时（默认 200ms），超时打印缺席 peer 并继续，避免“永等”。
-        """
-        # 一键关闭（便于快速验证是否与 barrier 有关）
-        if os.getenv("NIXL_DOWN_BARRIER", "1") == "0":
-            logger.warning("[DOWN-BAR] bypassed by NIXL_DOWN_BARRIER=0 (dst=%s key=%s grp=%d idx=%d leader=%s)",
-                           dst_engine_id, self._peek([notify_key]), group_size, peer_idx, is_leader)
-            return
-
-        d = self._barrier_dir(dst_engine_id, notify_key, group_size)
-        my_flag = os.path.join(d, f"{peer_idx}.ok")
-        try:
-            with open(my_flag, "w") as f:
-                f.write("ok")
-        except Exception as e:
-            logger.warning("[DOWN-BAR] write flag failed: %s", e)
-
-        if not is_leader:
-            return
-
-        # leader 等全员，带超时与缺席打印
-        try:
-            wait_ms = int(os.getenv("NIXL_DOWN_WAIT_MS", "200"))
-            deadline = time.time() + (wait_ms / 1000.0)
-            for i in range(group_size):
-                flag = os.path.join(d, f"{i}.ok")
-                while not os.path.exists(flag):
-                    if time.time() > deadline:
-                        missing = [j for j in range(group_size) if not os.path.exists(os.path.join(d, f"{j}.ok"))]
-                        logger.warning("[DOWN-BAR] timeout (%d ms): expected=%d, missing=%s ; continue",
-                                       wait_ms, group_size, missing[:8])
-                        # 超时后不再阻塞，允许继续流程，防止卡死
-                        break
-                    time.sleep(0.001)
-
-            # 清理
-            for i in range(group_size):
-                try:
-                    os.remove(os.path.join(d, f"{i}.ok"))
-                except OSError:
-                    pass
-            try:
-                os.rmdir(d)
-            except OSError:
-                pass
-        except Exception as e:
-            logger.warning("[DOWN-BAR] wait/cleanup failed: %s", e)
 
     @property
     def agent_name(self):
@@ -849,7 +798,25 @@ class DynamoNixlConnector:
                 if stats:
                     logger.info("[TIMING][READ] %s", stats)
 
+    def _barrier_mark_and_wait(self, key: str, expected: int, wait_ms: int) -> None:
+        """
+        强一致屏障：所有参与 rank 标记已就绪后才返回；
+        如果超时，直接抛错（不允许继续 IO）。
+        依赖已有的 _barrier_mark / _barrier_count。
+        """
+        import time
+        self._barrier_mark(key)
+        t0 = time.time()
+        while True:
+            got = self._barrier_count(key)
+            if got >= expected:
+                return
+            if (time.time() - t0) * 1000.0 > wait_ms:
+                raise RuntimeError(f"[DOWN-BAR] timeout: expected={expected}, got={got}, key={key}")
+            time.sleep(0.001)
+
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
+        import os, time
         with self._timing.span("write_blocks"):
             try:
                 logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
@@ -873,7 +840,7 @@ class DynamoNixlConnector:
                     return x if isinstance(x, str) else str(x)
 
                 if down is not None:
-                    # 再做一次快速断言，便于排查
+                    # 快速断言，便于排查
                     info = self._downscale_info[dst_engine_id]
                     rr = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
@@ -901,7 +868,7 @@ class DynamoNixlConnector:
                             logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
-                # ===== UP / EQ 路径（保持你的原逻辑）=====
+                # ===== UP / EQ 路径 =====
                 tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
@@ -1012,6 +979,7 @@ class DynamoNixlConnector:
         return self.nixl_wrapper.get_new_notifs()
 
     def _rebuild_down_dst_handle(self, dst_engine_id: str, remote_rank: int) -> None:
+        import os, torch
         info = self._downscale_info.get(dst_engine_id)
         assert info is not None, "[REPAIR] downscale info missing"
         group_size = int(info["group_size"])
@@ -1023,14 +991,12 @@ class DynamoNixlConnector:
         full_len = token_len_total * B
         peer_off_tok = peer_idx * token_len_local
 
-        # 选设备 id：优先用 kv_caches_dev_ids，其次用你原来的 engine->gpu 映射
+        # 选设备 id：优先 kv_caches_dev_ids，其次 engine->gpu 映射
         def _remote_dev_id(r_engine_id, r_idx, layer, entry_idx):
             devs = self.kv_caches_dev_ids.get(r_engine_id)
             if devs is not None:
                 return int(devs[r_idx][layer][entry_idx])
-            # 回退：保持和 add_remote_agent 相同的映射策略
             if not hasattr(self, "_engine_gpu_map") or r_engine_id not in self._engine_gpu_map:
-                # 默认放到 0（或你环境变量里的池），避免 KeyError
                 g = int(os.getenv("NIXL_REPAIR_DEFAULT_GPU", "0"))
                 if not hasattr(self, "_engine_gpu_map"):
                     self._engine_gpu_map = {}
@@ -1039,9 +1005,8 @@ class DynamoNixlConnector:
 
         # 重新拼装 dst token 粒度的块描述
         dst_blocks = []
-        num_blocks = self.dst_num_blocks_read.get(dst_engine_id)  # 注意：READ 用块计数
+        num_blocks = self.dst_num_blocks_read.get(dst_engine_id) if hasattr(self, "dst_num_blocks_read") else None
         if num_blocks is None:
-            # 回退：用 tokens 对齐的总单位换回块数（按 B）
             tokens_total = self.dst_num_blocks.get(dst_engine_id)
             assert tokens_total is not None, "[REPAIR] dst units missing"
             num_blocks = tokens_total // B
@@ -1070,8 +1035,8 @@ class DynamoNixlConnector:
 
         logger.info("[READY][REPAIR] dst handle rebuilt engine=%s rr=%d", dst_engine_id, remote_rank)
 
-
     def _ensure_engine_ready_for(self, dst_engine_id: str, wait_ms: int) -> None:
+        import time
         t0 = time.time()
         adopt_attempts = 0
         last_missing = "unknown"
@@ -1110,9 +1075,13 @@ class DynamoNixlConnector:
         while True:
             down_ready, down_miss, rr = _down_state()
             if down_ready:
+                # DOWN 路径采用强一致屏障，确保两个 rank 同步 ready
+                exp = self.world_size if hasattr(self, "world_size") else 2
+                key = f"down:{dst_engine_id}"
+                self._barrier_mark_and_wait(key, exp, wait_ms=int(os.getenv("NIXL_DOWN_BARRIER_MS", "15000")))
                 return
 
-            # *** REPAIR: 有 info 但缺 dst 句柄 —— 直接重建这一条句柄 ***
+            # 有 down_info 但缺 dst 句柄 —— 尝试自修复
             if self._downscale_info.get(dst_engine_id) is not None and rr is not None:
                 dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
                           rr in self.dst_xfer_side_handles[dst_engine_id] and
@@ -1120,10 +1089,9 @@ class DynamoNixlConnector:
                 if not dst_ok:
                     try:
                         self._rebuild_down_dst_handle(dst_engine_id, rr)
-                        # 重建成功后立刻复查
+                        # 重建成功后复查
                         continue
                     except Exception as e:
-                        # 当前 info 可能脏了，清理后交给 adopt
                         logger.warning(
                             "[READY][REPAIR] rebuild dst handle failed engine=%s rr=%s: %s ; purge info and retry adopt",
                             dst_engine_id, rr, e)
@@ -1138,7 +1106,7 @@ class DynamoNixlConnector:
 
             last_missing = down_miss if self._downscale_info.get(dst_engine_id) is not None else up_miss
 
-            # 未就绪 => 尝试 adopt（不管 _tp_size 是否已存在）
+            # 未就绪 => 尝试 adopt（无论 _tp_size 是否已存在）
             adopted = False
             try:
                 if hasattr(self, "_adopt_remote_md_from_cache"):
@@ -1162,14 +1130,15 @@ class DynamoNixlConnector:
     def add_remote_agent(
             self,
             engine_id: str,
-            agent_metadata: List[bytes],
+            agent_metadata: list[bytes],
             agent_tp: int,
-            kv_caches_base_addr: List[List[List[int]]],
+            kv_caches_base_addr: list[list[list[int]]],
             num_blocks: int,
-            kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
+            kv_caches_dev_ids: list[list[list[int]]] | None = None,
     ):
+        import os, torch
         with self._timing.span("add_remote_agent"):
-            # ---------- 幂等早退：如果这个 engine 已经完全就绪，直接复用 ----------
+            # ---------- 幂等早退 ----------
             if not hasattr(self, "_engine_ready"):
                 self._engine_ready = {}
             if self._engine_ready.get(engine_id, False):
@@ -1216,7 +1185,7 @@ class DynamoNixlConnector:
                 logger.debug("[ADD] _persist_remote_md_cache failed: %s", e)
 
             # 注册远端 agent（只建一次）
-            agent_names: List[str] = []
+            agent_names: list[str] = []
             for meta in agent_metadata:
                 agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
             self._remote_agents[engine_id] = agent_names
@@ -1246,7 +1215,7 @@ class DynamoNixlConnector:
 
             def _parse_pool(env_name: str, default_csv: str) -> list[int]:
                 s = os.getenv(env_name, default_csv).strip()
-                out = []
+                out: list[int] = []
                 for t in s.split(","):
                     t = t.strip()
                     if t:
