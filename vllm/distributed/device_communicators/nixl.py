@@ -798,21 +798,92 @@ class DynamoNixlConnector:
                 if stats:
                     logger.info("[TIMING][READ] %s", stats)
 
-    def _barrier_mark_and_wait(self, key: str, expected: int, wait_ms: int) -> None:
+    def _barrier_mark_and_wait(self, key: str, expected: int, wait_ms: int = 15000) -> None:
         """
-        强一致屏障：所有参与 rank 标记已就绪后才返回；
-        如果超时，直接抛错（不允许继续 IO）。
-        依赖已有的 _barrier_mark / _barrier_count。
+        轻量文件屏障（同机多进程可见）：
+          - 在 /dev/shm（或 /tmp）下创建一个唯一标记文件作为“已就绪”信号；
+          - 轮询计数匹配 key 的标记文件数量，>= expected 即通过；
+          - 超时抛错。
+        环境变量：
+          NIXL_BARRIER_DIR: 自定义屏障目录（默认 /dev/shm/nixl_barriers 或 /tmp/nixl_barriers）
+          NIXL_BARRIER_TTL_SEC: 清理旧标记的阈值（默认 60s）
         """
-        import time
-        self._barrier_mark(key)
-        t0 = time.time()
+        import os, time, errno, getpass, re, glob
+
+        # 目录选择
+        default_base = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else "/tmp"
+        base_dir = os.getenv("NIXL_BARRIER_DIR", os.path.join(default_base, "nixl_barriers"))
+        ttl_sec = int(os.getenv("NIXL_BARRIER_TTL_SEC", "60"))
+
+        # 命名空间：尽量把当前进程/引擎信息编码进去，避免串扰
+        ns_engine = getattr(self, "engine_id", "unknown")
+        ns_user = getpass.getuser()
+        ns = f"{ns_user}.{ns_engine}"
+
+        # 规范化 key，避免奇怪字符影响文件名
+        safe_key = re.sub(r"[^A-Za-z0-9._:+-]", "_", str(key))
+        ts = int(time.time() * 1000)
+
+        # 目录存在性
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+        # 清理过期文件（同一命名空间下）
+        try:
+            for path in glob.glob(os.path.join(base_dir, f"bar.{ns}.*")):
+                try:
+                    if time.time() - os.path.getmtime(path) > ttl_sec:
+                        os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 本进程的标记文件名（唯一）
+        my_mark = os.path.join(
+            base_dir,
+            f"bar.{ns}.{safe_key}.r{getattr(self, 'rank', 'x')}.p{os.getpid()}.{ts}"
+        )
+
+        # 落地标记
+        try:
+            with open(my_mark, "w") as f:
+                f.write(f"{time.time()}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            raise RuntimeError(f"[DOWN-BAR] cannot create mark file: {my_mark}: {e}")
+
+        # 轮询等待
+        deadline = time.time() + (wait_ms / 1000.0)
+        pattern = os.path.join(base_dir, f"bar.{ns}.{safe_key}.*")
+        last_count = -1
+
         while True:
-            got = self._barrier_count(key)
-            if got >= expected:
+            matches = glob.glob(pattern)
+            count = len(matches)
+
+            # 仅调试时打印一次计数变化
+            if count != last_count:
+                last_count = count
+                if count < expected:
+                    try:
+                        # 打印一个样例，便于排查
+                        sample = [os.path.basename(p) for p in matches[:4]]
+                        logger.debug("[DOWN-BAR] waiting key=%s count=%d/%d sample=%s",
+                                     safe_key, count, expected, sample)
+                    except Exception:
+                        pass
+
+            if count >= expected:
                 return
-            if (time.time() - t0) * 1000.0 > wait_ms:
-                raise RuntimeError(f"[DOWN-BAR] timeout: expected={expected}, got={got}, key={key}")
+
+            if time.time() > deadline:
+                raise RuntimeError(f"[DOWN-BAR] timeout: expected={expected}, got={count}, key={safe_key}, ns={ns}")
+
             time.sleep(0.001)
 
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
