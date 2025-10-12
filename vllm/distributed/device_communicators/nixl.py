@@ -275,9 +275,7 @@ class DynamoNixlConnector:
                 inflight.clear()
 
             # 组内 barrier：只有 leader 等全员
-            key = self._barrier_key(dst_engine_id, notify_payload)
-            self._barrier_mark_and_wait(key, info["group_size"],
-                                        wait_ms=int(os.getenv("NIXL_BARRIER_WAIT_MS", "15000")))
+            self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
 
             # 最后一批 piggyback 通知；极端 0-token 情况下仅发通知
             if last_req_args is None:
@@ -455,6 +453,57 @@ class DynamoNixlConnector:
         os.makedirs(d, exist_ok=True)
         return d
 
+    def _barrier_mark_and_wait(self, dst_engine_id: str, notify_key: str,
+                               group_size: int, peer_idx: int, is_leader: bool) -> None:
+        """
+        组内 barrier（仅 leader 等全员）。新增两个行为：
+        - NIXL_DOWN_BARRIER=0 时直接短路（用于快速定位/绕过）。
+        - NIXL_DOWN_WAIT_MS 超时（默认 200ms），超时打印缺席 peer 并继续，避免“永等”。
+        """
+        # 一键关闭（便于快速验证是否与 barrier 有关）
+        if os.getenv("NIXL_DOWN_BARRIER", "1") == "0":
+            logger.warning("[DOWN-BAR] bypassed by NIXL_DOWN_BARRIER=0 (dst=%s key=%s grp=%d idx=%d leader=%s)",
+                           dst_engine_id, self._peek([notify_key]), group_size, peer_idx, is_leader)
+            return
+
+        d = self._barrier_dir(dst_engine_id, notify_key, group_size)
+        my_flag = os.path.join(d, f"{peer_idx}.ok")
+        try:
+            with open(my_flag, "w") as f:
+                f.write("ok")
+        except Exception as e:
+            logger.warning("[DOWN-BAR] write flag failed: %s", e)
+
+        if not is_leader:
+            return
+
+        # leader 等全员，带超时与缺席打印
+        try:
+            wait_ms = int(os.getenv("NIXL_DOWN_WAIT_MS", "200"))
+            deadline = time.time() + (wait_ms / 1000.0)
+            for i in range(group_size):
+                flag = os.path.join(d, f"{i}.ok")
+                while not os.path.exists(flag):
+                    if time.time() > deadline:
+                        missing = [j for j in range(group_size) if not os.path.exists(os.path.join(d, f"{j}.ok"))]
+                        logger.warning("[DOWN-BAR] timeout (%d ms): expected=%d, missing=%s ; continue",
+                                       wait_ms, group_size, missing[:8])
+                        # 超时后不再阻塞，允许继续流程，防止卡死
+                        break
+                    time.sleep(0.001)
+
+            # 清理
+            for i in range(group_size):
+                try:
+                    os.remove(os.path.join(d, f"{i}.ok"))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.warning("[DOWN-BAR] wait/cleanup failed: %s", e)
 
     @property
     def agent_name(self):
@@ -800,140 +849,81 @@ class DynamoNixlConnector:
                 if stats:
                     logger.info("[TIMING][READ] %s", stats)
 
-    def _barrier_mark_and_wait(self, key: str, expected: int, wait_ms: int = 15000) -> None:
-        """
-        轻量文件屏障（同机多进程可见）：
-          - 在 /dev/shm（或 /tmp）下创建一个唯一标记文件作为“已就绪”信号；
-          - 轮询计数匹配 key 的标记文件数量，>= expected 即通过；
-          - 超时抛错。
-        环境变量：
-          NIXL_BARRIER_DIR: 自定义屏障目录（默认 /dev/shm/nixl_barriers 或 /tmp/nixl_barriers）
-          NIXL_BARRIER_TTL_SEC: 清理旧标记的阈值（默认 60s）
-        """
-        import os, time, errno, getpass, re, glob
-
-        # 目录选择
-        default_base = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else "/tmp"
-        base_dir = os.getenv("NIXL_BARRIER_DIR", os.path.join(default_base, "nixl_barriers"))
-        ttl_sec = int(os.getenv("NIXL_BARRIER_TTL_SEC", "60"))
-
-        # 命名空间：尽量把当前进程/引擎信息编码进去，避免串扰
-        ns_engine = getattr(self, "engine_id", "unknown")
-        ns_user = getpass.getuser()
-        ns = f"{ns_user}.{ns_engine}"
-
-        # 规范化 key，避免奇怪字符影响文件名
-        safe_key = re.sub(r"[^A-Za-z0-9._:+-]", "_", str(key))
-        ts = int(time.time() * 1000)
-
-        # 目录存在性
-        try:
-            os.makedirs(base_dir, exist_ok=True)
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
-
-        # 清理过期文件（同一命名空间下）
-        try:
-            for path in glob.glob(os.path.join(base_dir, f"bar.{ns}.*")):
-                try:
-                    if time.time() - os.path.getmtime(path) > ttl_sec:
-                        os.remove(path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 本进程的标记文件名（唯一）
-        my_mark = os.path.join(
-            base_dir,
-            f"bar.{ns}.{safe_key}.r{getattr(self, 'rank', 'x')}.p{os.getpid()}.{ts}"
-        )
-
-        # 落地标记
-        try:
-            with open(my_mark, "w") as f:
-                f.write(f"{time.time()}\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as e:
-            raise RuntimeError(f"[DOWN-BAR] cannot create mark file: {my_mark}: {e}")
-
-        # 轮询等待
-        deadline = time.time() + (wait_ms / 1000.0)
-        pattern = os.path.join(base_dir, f"bar.{ns}.{safe_key}.*")
-        last_count = -1
-
-        while True:
-            matches = glob.glob(pattern)
-            count = len(matches)
-
-            # 仅调试时打印一次计数变化
-            if count != last_count:
-                last_count = count
-                if count < expected:
-                    try:
-                        # 打印一个样例，便于排查
-                        sample = [os.path.basename(p) for p in matches[:4]]
-                        logger.debug("[DOWN-BAR] waiting key=%s count=%d/%d sample=%s",
-                                     safe_key, count, expected, sample)
-                    except Exception:
-                        pass
-
-            if count >= expected:
-                return
-
-            if time.time() > deadline:
-                raise RuntimeError(f"[DOWN-BAR] timeout: expected={expected}, got={count}, key={safe_key}, ns={ns}")
-
-            time.sleep(0.001)
-
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        import os, time
         with self._timing.span("write_blocks"):
             try:
                 logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
                             dst_engine_id, len(local_block_ids), len(staging_block_ids),
                             len(remote_block_ids), type(notify_msg).__name__)
 
-                # --- 长度一致性 ---
                 assert len(staging_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
-                # --- 先确保“本 rank 对 dst_engine”的就绪（包含 adopt + 句柄就绪等待）---
+                # 只等待 add_remote_agent 的产物就绪（不做任何“收养/构建”）
                 wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
-                self._ensure_engine_ready_for(dst_engine_id, wait_ms)
+                t0 = time.time()
+                last_missing = "unknown"
 
-                # --- 分支：DOWN 优先（因为 add_remote_agent 在 tp_mult==0 会写入 _downscale_info）---
-                down = self._downscale_info.get(dst_engine_id)
+                while True:
+                    down = self._downscale_info.get(dst_engine_id)
+                    if down is not None:
+                        rr = down.get("remote_rank")
+                        src_ok = (1 in self.src_xfer_side_handles and self.src_xfer_side_handles[1] is not None)
+                        dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
+                                  rr in self.dst_xfer_side_handles[dst_engine_id] and
+                                  self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
+                        nb_ok = (dst_engine_id in self.dst_num_blocks)
+                        if src_ok and dst_ok and nb_ok:
+                            break
+                        last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
+                    else:
+                        tp_dst = self._tp_size.get(dst_engine_id)
+                        tp_src = self._tp_size.get(self.engine_id)
+                        if tp_dst is not None and tp_src is not None and tp_src > 0:
+                            tp_mult = tp_dst // tp_src
+                            eff_tp = max(1, tp_mult)
+                            src_ok = (tp_mult in self.src_xfer_side_handles
+                                      and self.src_xfer_side_handles[tp_mult] is not None)
+                            dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
+                            dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
+                            nb_ok = (dst_engine_id in self.dst_num_blocks)
+                            if tp_mult >= 1 and src_ok and dst_ok and nb_ok:
+                                break
+                            last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
+                                            f"tp_mult={tp_mult}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
+                        else:
+                            last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
 
+                    if (time.time() - t0) * 1000.0 > wait_ms:
+                        raise RuntimeError(
+                            f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
+                            f"_tp_size_keys={list(self._tp_size.keys())} src_keys={list(self.src_xfer_side_handles.keys())} "
+                            f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
+                        )
+                    time.sleep(0.001)
+
+                # ---- 真正传输 ----
                 def _to_notify_str(x):
                     return x if isinstance(x, str) else str(x)
 
-                if down is not None:
-                    # 快速断言，便于排查
+                if self._downscale_info.get(dst_engine_id) is not None:
                     info = self._downscale_info[dst_engine_id]
-                    rr = info["remote_rank"]
+                    remote_rank = info["remote_rank"]
                     if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                        raise RuntimeError(
-                            f"[WRITE] DOWN missing src handle (rank={self.rank}) keys={list(self.src_xfer_side_handles.keys())}")
+                        raise RuntimeError(f"[WRITE] DOWN missing src handle (rank={self.rank})")
                     if (dst_engine_id not in self.dst_xfer_side_handles or
-                            rr not in self.dst_xfer_side_handles[dst_engine_id]):
-                        raise RuntimeError(f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={rr}) "
-                                           f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
-                                           f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}")
+                            remote_rank not in self.dst_xfer_side_handles[dst_engine_id]):
+                        raise RuntimeError(f"[WRITE] DOWN missing dst handle (rank={self.rank} rr={remote_rank})")
 
                     self._write_blocks_down(local_block_ids, remote_block_ids, dst_engine_id, notify_msg)
-
-                    if os.getenv("NIXL_DOWN_VERIFY", "1") == "1":
+                    if os.getenv("NIXL_DOWN_VERIFY", "0") == "1":  # 默认关闭验证，避免打断吞吐
                         try:
                             if remote_block_ids:
                                 self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
                         except Exception as e:
                             logger.warning("[DOWN-CHK] verify failed: %s", e)
-
                     logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
@@ -941,7 +931,7 @@ class DynamoNixlConnector:
                             logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
-                # ===== UP / EQ 路径 =====
+                # ===== UP / EQ =====
                 tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
@@ -961,7 +951,7 @@ class DynamoNixlConnector:
                         trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
                         key = _to_notify_str(notify_msg)
                         self.nixl_wrapper.send_notif(trg, key)
-                    logger.info("[WRITE] zero-block broadcast sent (tp=%s)", tp_multiplier)
+                    logger.info("[WRITE] zero-block notify sent (tp=%s)", tp_multiplier)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
                         if stats:
@@ -980,8 +970,7 @@ class DynamoNixlConnector:
 
                 remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
                 local_handle = self.src_xfer_side_handles[tp_multiplier]
-                created, handles = 0, []
-
+                handles = []
                 notify_payload_str = _to_notify_str(notify_msg)
 
                 for i in targets:
@@ -992,7 +981,6 @@ class DynamoNixlConnector:
                     if len(staging_block_descs_ids) != len(remote_block_descs_ids):
                         raise RuntimeError("desc length mismatch")
                     remote_handle = self.dst_xfer_side_handles[dst_engine_id][i]
-
                     h = self.nixl_wrapper.make_prepped_xfer(
                         "WRITE",
                         local_handle, staging_block_descs_ids,
@@ -1003,22 +991,20 @@ class DynamoNixlConnector:
                         self._transfers.setdefault(notify_payload_str, []).append(h)
                     self.nixl_wrapper.transfer(h)
                     handles.append(h)
-                    created += 1
 
+                # 等待全部完成
                 pending = list(handles)
                 while pending:
                     nxt = []
                     for h in pending:
                         st = self.nixl_wrapper.check_xfer_state(h)
-                        if st == "DONE":
-                            continue
+                        if st == "DONE": continue
                         if st == "PROC":
                             nxt.append(h)
                         else:
-                            raise RuntimeError(f"[WRITE] transfer failed with state {st}")
+                            raise RuntimeError(f"[WRITE] transfer failed state={st}")
                     pending = nxt
-                    if pending:
-                        time.sleep(0.001)
+                    if pending: time.sleep(0.001)
 
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
                 if self._timing_autolog:
@@ -1051,167 +1037,17 @@ class DynamoNixlConnector:
     def get_new_notifs(self):
         return self.nixl_wrapper.get_new_notifs()
 
-    def _rebuild_down_dst_handle(self, dst_engine_id: str, remote_rank: int) -> None:
-        import os, torch
-        info = self._downscale_info.get(dst_engine_id)
-        assert info is not None, "[REPAIR] downscale info missing"
-        group_size = int(info["group_size"])
-        peer_idx = int(info["peer_idx"])
-
-        B = int(self.block_size)
-        token_len_local = self.block_len // B
-        token_len_total = token_len_local * group_size
-        full_len = token_len_total * B
-        peer_off_tok = peer_idx * token_len_local
-
-        # 选设备 id：优先 kv_caches_dev_ids，其次 engine->gpu 映射
-        def _remote_dev_id(r_engine_id, r_idx, layer, entry_idx):
-            devs = self.kv_caches_dev_ids.get(r_engine_id)
-            if devs is not None:
-                return int(devs[r_idx][layer][entry_idx])
-            if not hasattr(self, "_engine_gpu_map") or r_engine_id not in self._engine_gpu_map:
-                g = int(os.getenv("NIXL_REPAIR_DEFAULT_GPU", "0"))
-                if not hasattr(self, "_engine_gpu_map"):
-                    self._engine_gpu_map = {}
-                self._engine_gpu_map[r_engine_id] = g
-            return int(self._engine_gpu_map[r_engine_id])
-
-        # 重新拼装 dst token 粒度的块描述
-        dst_blocks = []
-        num_blocks = self.dst_num_blocks_read.get(dst_engine_id) if hasattr(self, "dst_num_blocks_read") else None
-        if num_blocks is None:
-            tokens_total = self.dst_num_blocks.get(dst_engine_id)
-            assert tokens_total is not None, "[REPAIR] dst units missing"
-            num_blocks = tokens_total // B
-
-        for layer in range(self.num_layers):
-            layer_bases = self.kv_caches_base_addr[dst_engine_id][remote_rank][layer]
-            for entry_idx, rbase in enumerate(layer_bases):  # K / V
-                rdev = _remote_dev_id(dst_engine_id, remote_rank, layer, entry_idx)
-                for bid in range(num_blocks):
-                    base_block = rbase + bid * full_len
-                    for t in range(B):
-                        dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
-                                           token_len_local, rdev))
-
-        dst_desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-        h = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[dst_engine_id][remote_rank], dst_desc)
-
-        if dst_engine_id not in self.dst_xfer_side_handles:
-            self.dst_xfer_side_handles[dst_engine_id] = {}
-        self.dst_xfer_side_handles[dst_engine_id][remote_rank] = h
-
-        try:
-            self.nixl_wrapper.make_connection(self._remote_agents[dst_engine_id][remote_rank])
-        except Exception:
-            pass
-
-        logger.info("[READY][REPAIR] dst handle rebuilt engine=%s rr=%d", dst_engine_id, remote_rank)
-
-    def _ensure_engine_ready_for(self, dst_engine_id: str, wait_ms: int) -> None:
-        import time
-        t0 = time.time()
-        adopt_attempts = 0
-        last_missing = "unknown"
-
-        def _down_state():
-            info = self._downscale_info.get(dst_engine_id)
-            if info is None:
-                return False, "down_info=None", None
-            rr = info.get("remote_rank")
-            src_ok = (1 in self.src_xfer_side_handles and self.src_xfer_side_handles[1] is not None)
-            dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
-                      rr in self.dst_xfer_side_handles[dst_engine_id] and
-                      self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
-            nb_ok = (dst_engine_id in self.dst_num_blocks)
-            ready = (src_ok and dst_ok and nb_ok)
-            miss = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
-            return ready, miss, rr
-
-        def _up_state():
-            tp_dst = self._tp_size.get(dst_engine_id)
-            tp_src = self._tp_size.get(self.engine_id)
-            if tp_dst is None or tp_src is None or tp_src <= 0:
-                return False, f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
-            tp_mult = tp_dst // tp_src
-            eff_tp = max(1, tp_mult)
-            src_ok = (tp_mult in self.src_xfer_side_handles and
-                      self.src_xfer_side_handles[tp_mult] is not None)
-            dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
-            dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
-            nb_ok = (dst_engine_id in self.dst_num_blocks)
-            ready = (tp_mult >= 1 and src_ok and dst_ok and nb_ok)
-            miss = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, tp_mult={tp_mult}, "
-                    f"src={src_ok}, dst={dst_ok}, nb={nb_ok})")
-            return ready, miss
-
-        while True:
-            down_ready, down_miss, rr = _down_state()
-            if down_ready:
-                # DOWN 路径采用强一致屏障，确保两个 rank 同步 ready
-                exp = self.world_size if hasattr(self, "world_size") else 2
-                key = f"down:{dst_engine_id}"
-                self._barrier_mark_and_wait(key, exp, wait_ms=int(os.getenv("NIXL_DOWN_BARRIER_MS", "15000")))
-                return
-
-            # 有 down_info 但缺 dst 句柄 —— 尝试自修复
-            if self._downscale_info.get(dst_engine_id) is not None and rr is not None:
-                dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
-                          rr in self.dst_xfer_side_handles[dst_engine_id] and
-                          self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
-                if not dst_ok:
-                    try:
-                        self._rebuild_down_dst_handle(dst_engine_id, rr)
-                        # 重建成功后复查
-                        continue
-                    except Exception as e:
-                        logger.warning(
-                            "[READY][REPAIR] rebuild dst handle failed engine=%s rr=%s: %s ; purge info and retry adopt",
-                            dst_engine_id, rr, e)
-                        try:
-                            self._downscale_info.pop(dst_engine_id, None)
-                        except Exception:
-                            pass
-
-            up_ready, up_miss = _up_state()
-            if up_ready:
-                return
-
-            last_missing = down_miss if self._downscale_info.get(dst_engine_id) is not None else up_miss
-
-            # 未就绪 => 尝试 adopt（无论 _tp_size 是否已存在）
-            adopted = False
-            try:
-                if hasattr(self, "_adopt_remote_md_from_cache"):
-                    adopted = self._adopt_remote_md_from_cache(dst_engine_id)
-            except Exception as e:
-                logger.warning("[READY] adopt failed engine=%s: %s", dst_engine_id, e)
-            if adopted:
-                adopt_attempts += 1
-                logger.info("[READY] adopt success engine=%s (attempt=%d)", dst_engine_id, adopt_attempts)
-                continue
-
-            if (time.time() - t0) * 1000.0 > wait_ms:
-                raise RuntimeError(
-                    f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
-                    f"_tp_size_keys={list(self._tp_size.keys())} "
-                    f"src_keys={list(self.src_xfer_side_handles.keys())} "
-                    f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
-                )
-            time.sleep(0.001)
-
     def add_remote_agent(
             self,
             engine_id: str,
-            agent_metadata: list[bytes],
+            agent_metadata: List[bytes],
             agent_tp: int,
-            kv_caches_base_addr: list[list[list[int]]],
+            kv_caches_base_addr: List[List[List[int]]],
             num_blocks: int,
-            kv_caches_dev_ids: list[list[list[int]]] | None = None,
+            kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
-        import os, torch
         with self._timing.span("add_remote_agent"):
-            # ---------- 幂等早退 ----------
+            # ---------- 幂等早退：如果这个 engine 已经完全就绪，直接复用 ----------
             if not hasattr(self, "_engine_ready"):
                 self._engine_ready = {}
             if self._engine_ready.get(engine_id, False):
@@ -1258,7 +1094,7 @@ class DynamoNixlConnector:
                 logger.debug("[ADD] _persist_remote_md_cache failed: %s", e)
 
             # 注册远端 agent（只建一次）
-            agent_names: list[str] = []
+            agent_names: List[str] = []
             for meta in agent_metadata:
                 agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
             self._remote_agents[engine_id] = agent_names
@@ -1288,7 +1124,7 @@ class DynamoNixlConnector:
 
             def _parse_pool(env_name: str, default_csv: str) -> list[int]:
                 s = os.getenv(env_name, default_csv).strip()
-                out: list[int] = []
+                out = []
                 for t in s.split(","):
                     t = t.strip()
                     if t:
