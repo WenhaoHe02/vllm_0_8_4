@@ -874,12 +874,22 @@ class DynamoNixlConnector:
                 assert len(remote_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: remote={len(remote_block_ids)} local={len(local_block_ids)}"
 
-                # 只等待 add_remote_agent 的产物就绪（不做任何“收养/构建”）
+                # 只等待 add_remote_agent 的产物就绪；若本进程尚未注册该 dst，则尝试从共享缓存“收养”
                 wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
                 t0 = time.time()
                 last_missing = "unknown"
 
                 while True:
+                    # —— 新增：若缺元数据/句柄，尝试从 /dev/shm（或 NIXL_MD_CACHE_DIR）收养一次
+                    if (dst_engine_id not in self._tp_size
+                            or dst_engine_id not in self.dst_xfer_side_handles
+                            or not self.dst_xfer_side_handles.get(dst_engine_id)):
+                        try:
+                            if self._adopt_remote_md_from_cache(dst_engine_id):
+                                logger.info("[WRITE][ADOPT] adopted remote metadata for dst=%s", dst_engine_id)
+                        except Exception as _e:
+                            logger.debug("[WRITE][ADOPT] adopt failed for dst=%s: %s", dst_engine_id, _e)
+
                     down = self._downscale_info.get(dst_engine_id)
                     if down is not None:
                         rr = down.get("remote_rank")
@@ -907,6 +917,13 @@ class DynamoNixlConnector:
                             last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
                                             f"tp_mult={tp_mult}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
                         else:
+                            # —— 新增：再尝试一次晚到的收养，避免竞态
+                            try:
+                                if self._adopt_remote_md_from_cache(dst_engine_id):
+                                    logger.info("[WRITE][ADOPT] late-adopted metadata for dst=%s", dst_engine_id)
+                                    continue
+                            except Exception as _e:
+                                logger.debug("[WRITE][ADOPT] late adopt failed for dst=%s: %s", dst_engine_id, _e)
                             last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has={tp_src is not None})"
 
                     if (time.time() - t0) * 1000.0 > wait_ms:
@@ -1011,13 +1028,15 @@ class DynamoNixlConnector:
                     nxt = []
                     for h in pending:
                         st = self.nixl_wrapper.check_xfer_state(h)
-                        if st == "DONE": continue
+                        if st == "DONE":
+                            continue
                         if st == "PROC":
                             nxt.append(h)
                         else:
                             raise RuntimeError(f"[WRITE] transfer failed state={st}")
                     pending = nxt
-                    if pending: time.sleep(0.001)
+                    if pending:
+                        time.sleep(0.001)
 
                 logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
                 if self._timing_autolog:
