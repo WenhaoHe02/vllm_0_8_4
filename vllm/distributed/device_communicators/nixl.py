@@ -275,7 +275,9 @@ class DynamoNixlConnector:
                 inflight.clear()
 
             # 组内 barrier：只有 leader 等全员
-            self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
+            key = self._barrier_key(dst_engine_id, notify_payload)
+            self._barrier_mark_and_wait(key, info["group_size"],
+                                        wait_ms=int(os.getenv("NIXL_BARRIER_WAIT_MS", "15000")))
 
             # 最后一批 piggyback 通知；极端 0-token 情况下仅发通知
             if last_req_args is None:
