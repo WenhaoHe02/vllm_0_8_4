@@ -1109,6 +1109,7 @@ class DynamoNixlConnector:
             logger.info("[ADD] remote_agents registered: dst_engine=%s count=%d names_sample=%s",
                         engine_id, len(agent_names), self._peek(agent_names, 3))
 
+            # 保存对端元数据
             self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
             self.kv_caches_dev_ids[engine_id] = kv_caches_dev_ids if kv_caches_dev_ids is not None else None
             loc_base = self.kv_caches_base_addr[engine_id]
@@ -1123,7 +1124,7 @@ class DynamoNixlConnector:
                 for L in range(self.num_layers):
                     assert len(loc_base[r][L]) == self.num_cache_entries
 
-            # ========= 仅供 DOWN 分支使用的 pool 索引映射工具（UP/EQ 不改）=========
+            # ========= 仅用于 DOWN 分支的远端 pool 索引映射 =========
             import hashlib
 
             def _stable_hash_u32(s: str) -> int:
@@ -1149,11 +1150,7 @@ class DynamoNixlConnector:
                             pass
                 return out
 
-            # 远端（对方）的角色：decode=VLLMWORKER（tp=1），prefill=PREFILLWORKER（tp>1）
             remote_role = "VLLMWORKER" if int(agent_tp) == 1 else "PREFILLWORKER"
-            # 本端的角色（只用于本地 pool 索引推导）
-            local_role = "VLLMWORKER" if int(self._tp_size[self.engine_id]) == 1 else "PREFILLWORKER"
-
             vllm_pool_cuda = _parse_pool(["NIXL_POOL_VLLMWORKER", "NIXL_POOL"], "0,1")
             prefill_pool_cuda = _parse_pool(["NIXL_POOL_PREFILLWORKER", "NIXL_POOL"], "0,1")
 
@@ -1180,48 +1177,8 @@ class DynamoNixlConnector:
                             eid, role, worker_idx, pool_index, pool, base_slot)
                 return int(pool_index)
 
-            def _cuda_global_from_visible(local_ord: int):
-                cvd = os.getenv("CUDA_VISIBLE_DEVICES")
-                if not cvd:
-                    return local_ord
-                parts = [p.strip() for p in cvd.split(",") if p.strip()]
-                if any(not p.isdigit() for p in parts):
-                    return None
-                arr = [int(p) for p in parts]
-                if 0 <= local_ord < len(arr):
-                    return arr[local_ord]
-                return None
-
-            def _local_pool_index(role: str) -> int:
-                # 1) 显式指定
-                env = os.getenv("NIXL_LOCAL_POOL_INDEX")
-                if env is not None:
-                    try:
-                        idx = int(env)
-                        logger.info("[ADD][LOCAL] NIXL_LOCAL_POOL_INDEX=%d", idx)
-                        return idx
-                    except:
-                        logger.warning("[ADD][LOCAL] invalid NIXL_LOCAL_POOL_INDEX=%r", env)
-                # 2) 自动映射：local CUDA -> global CUDA -> 在 pool 里找位置
-                try:
-                    local_ord = int(torch.cuda.current_device())
-                except Exception:
-                    local_ord = 0
-                global_ord = _cuda_global_from_visible(local_ord)
-                pool_cuda = _pool_cuda_for_role(role)
-                if global_ord is not None and pool_cuda:
-                    try:
-                        idx = pool_cuda.index(global_ord)
-                        logger.info("[ADD][LOCAL] mapped local_cuda=%s global_cuda=%s -> pool_index=%d (pool_cuda=%s)",
-                                    local_ord, global_ord, idx, pool_cuda)
-                        return idx
-                    except ValueError:
-                        logger.warning("[ADD][LOCAL] global_cuda=%s not in pool_cuda=%s, fallback 0", global_ord,
-                                       pool_cuda)
-                return 0
-
             def _remote_pool_index_by_md_or_map(r_engine_id: str, r_idx: int, layer: int, entry_idx: int) -> int:
-                # 1) 远端显式提供（必须也是 pool 索引）
+                # 1) 远端显式提供（必须是 pool 索引）
                 devs = self.kv_caches_dev_ids.get(r_engine_id)
                 if devs is not None:
                     try:
@@ -1237,7 +1194,7 @@ class DynamoNixlConnector:
             logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                         tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
-            # --------- DOWN（prefill -> decode，tp_multiplier == 0）【仅此处有改动】---------
+            # --------- DOWN（prefill -> decode，tp_multiplier == 0）【仅此处改动本地 dev_id 用 self.rank】---------
             if tp_multiplier == 0 and not self._is_mla:
                 group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
                 remote_rank = self.rank // group_size
@@ -1267,21 +1224,20 @@ class DynamoNixlConnector:
                     group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len,
                     peer_off_tok)
 
-                # src dlist（仅一次）—— 第三参数改为“本地 pool 索引”
+                # src dlist（仅一次）—— 本地 dev_id 用 self.rank
                 if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
                     src_blocks = []
-                    local_pool_idx = _local_pool_index(local_role)
+                    local_dev_id = self.rank
                     for layer in range(self.num_layers):
                         for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V
                             for bid in range(self.num_blocks):
                                 base_block = base + bid * seg_len
                                 for t in range(B):
-                                    src_blocks.append(
-                                        (base_block + t * token_len_local, token_len_local, local_pool_idx))
+                                    src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
                     desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
                     self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", desc)
 
-                # dst dlist（仅一次）—— 第三参数改为“远端 pool 索引”，用 kv_caches_dev_ids 或确定性映射
+                # dst dlist（仅一次）—— 远端 dev_id 用“pool 索引”（kv_caches_dev_ids 或稳定映射）
                 if engine_id not in self.dst_xfer_side_handles:
                     self.dst_xfer_side_handles[engine_id] = {}
                 if remote_rank not in self.dst_xfer_side_handles[engine_id]:
@@ -1304,20 +1260,20 @@ class DynamoNixlConnector:
                     except Exception as e:
                         logger.debug("make_connection lazy: %s", e)
 
-                # READ-DOWN 本地目的 dlist（第三参数=本地 pool 索引）
+                # READ-DOWN 本地目的 dlist（本地 dev_id 用 self.rank）
                 if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles[
                     "read_down_src"] is None:
                     blocks_local = []
-                    local_pool_idx = _local_pool_index(local_role)
+                    local_dev_id = self.rank
                     for layer in range(self.num_layers):
                         for base in self.kv_caches_base_addr[self.engine_id][layer]:
                             for bid in range(self.num_blocks):
                                 block_offset = bid * self.block_len
-                                blocks_local.append((base + block_offset, self.block_len, local_pool_idx))
+                                blocks_local.append((base + block_offset, self.block_len, local_dev_id))
                     descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
                     self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
 
-                # READ-DOWN 远端来源 dlist（第三参数=远端 pool 索引）
+                # READ-DOWN 远端来源 dlist（远端 dev_id 用“pool 索引”）
                 if "read_down_dst" not in self.dst_xfer_side_handles[engine_id]:
                     blocks_remote = []
                     for layer in range(self.num_layers):
@@ -1350,7 +1306,7 @@ class DynamoNixlConnector:
                 self._engine_ready[engine_id] = True
                 return agent_names
 
-            # --------- UP / EQ（tp_multiplier > 0）---------  # <- 这部分保持你原来的实现，不改
+            # --------- UP / EQ（tp_multiplier > 0）---------  # ← 保持原始实现，不改
             assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
             logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
@@ -1363,7 +1319,6 @@ class DynamoNixlConnector:
                             block_offset = block_id * self.block_len
                             for i in range(1 if self._is_mla else tp_multiplier):
                                 tp_off = i * dst_block_len
-                                # 保持原样（不改）：第三参数按你原来的实现
                                 blocks_data.append((base_addr + block_offset + tp_off, dst_block_len, self.rank))
                 descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
                 self.src_xfer_side_handles[tp_multiplier] = self.nixl_wrapper.prep_xfer_dlist("", descs)
@@ -1381,7 +1336,6 @@ class DynamoNixlConnector:
                     for entry_idx, base_addr in enumerate(layer_bases):
                         for block_id in range(num_blocks):
                             block_offset = block_id * dst_block_len
-                            # 保持原样（不改）：第三参数按你原来的实现
                             blocks_data.append((base_addr + block_offset, dst_block_len, int(remote_idx)))
                 descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
                 self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(
