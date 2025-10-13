@@ -584,6 +584,21 @@ class DynamoNixlConnector:
                 self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
             )
 
+
+        if _env_flag("NIXL_PUBLISH_SELF_MD", True):
+            try:
+                self._persist_remote_md_cache(
+                    engine_id=self.engine_id,
+                    agent_metadata=self.get_agent_metadata(),
+                    kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
+                    num_blocks=int(self.num_blocks),
+                    kv_caches_dev_ids=self.kv_caches_dev_ids.get(self.engine_id),
+                    agent_tp=int(self._tp_size[self.engine_id]),
+                )
+                logger.info("[MD-CACHE][SELF] published engine=%s", self.engine_id)
+            except Exception as e:
+                logger.debug("[MD-CACHE][SELF] publish failed: %s", e)
+
     def get_agent_metadata(self):
         return self.nixl_wrapper.get_agent_metadata()
 
@@ -880,7 +895,7 @@ class DynamoNixlConnector:
                 last_missing = "unknown"
 
                 while True:
-                    # —— 新增：若缺元数据/句柄，尝试从 /dev/shm（或 NIXL_MD_CACHE_DIR）收养一次
+                    # —— 若缺元数据/句柄，优先尝试从 NIXL_MD_CACHE_DIR 收养一次（调用 add_remote_agent）
                     if (dst_engine_id not in self._tp_size
                             or dst_engine_id not in self.dst_xfer_side_handles
                             or not self.dst_xfer_side_handles.get(dst_engine_id)):
@@ -917,7 +932,7 @@ class DynamoNixlConnector:
                             last_missing = (f"up_ready(tp_dst={tp_dst}, tp_src={tp_src}, "
                                             f"tp_mult={tp_mult}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
                         else:
-                            # —— 新增：再尝试一次晚到的收养，避免竞态
+                            # —— 再尝试一次晚到的收养，避免竞态
                             try:
                                 if self._adopt_remote_md_from_cache(dst_engine_id):
                                     logger.info("[WRITE][ADOPT] late-adopted metadata for dst=%s", dst_engine_id)
