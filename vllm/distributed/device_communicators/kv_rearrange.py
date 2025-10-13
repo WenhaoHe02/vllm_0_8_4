@@ -16,7 +16,10 @@
 import torch
 import triton
 import triton.language as tl
+import logging
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 @triton.jit
 def rearrange_kernel_read(
     t1_ptr,
@@ -334,7 +337,7 @@ def rearrange_tensors_read_down(
     assert t_standard.shape == t_grouped.shape and t_standard.ndim == 4
     assert t_standard.is_contiguous() and t_grouped.is_contiguous()
     N, B, H, C = t_standard.shape
-    logger.error(f"[DBG] read_down shapes N={N}, B={B}, H={H}, C={C}, ngroups={ngroups}, "
+    logger.debug(f"[DBG] read_down shapes N={N}, B={B}, H={H}, C={C}, ngroups={ngroups}, "
                  f"tp_src={tp_src}, tp_dst={tp_dst}, num_kv_heads(global)={num_kv_heads}")
 
     assert ngroups > 0 and (H % ngroups == 0)
