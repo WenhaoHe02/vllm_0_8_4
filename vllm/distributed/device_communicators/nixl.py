@@ -802,12 +802,12 @@ class DynamoNixlConnector:
             agent_tp = int(data["agent_tp"])
             # ★ 关键：强制把 agent_metadata 变成 List[bytes]
             agent_metadata = self._coerce_agent_metadata(data.get("agent_metadata"))
-
+            kv_rows_norm = self._normalize_kv_rows(engine_id, data["kv_caches_base_addr"], agent_tp)
             self.add_remote_agent(
                 engine_id=data["engine_id"],
                 agent_metadata=agent_metadata,
                 agent_tp=agent_tp,
-                kv_caches_base_addr=data["kv_caches_base_addr"],
+                kv_caches_base_addr=kv_rows_norm,
                 num_blocks=int(data["num_blocks"]),
                 kv_caches_dev_ids=data.get("kv_caches_dev_ids"),
             )
@@ -1119,6 +1119,33 @@ class DynamoNixlConnector:
 
     def get_new_notifs(self):
         return self.nixl_wrapper.get_new_notifs()
+
+    def _normalize_kv_rows(self, engine_id: str, rows, agent_tp: int):
+        """
+        允许两种输入：
+          - 三维: [tp][layers][entries]  -> 直接返回
+          - 二维: [layers][entries] 且 agent_tp==1 -> 自动包一层变成 [1][layers][entries]
+        其它形状一律报错，防止静默错配。
+        """
+        if rows is None:
+            return []
+
+        # 三维且外层等于 agent_tp：认为已是规范形状
+        if (isinstance(rows, list) and rows and isinstance(rows[0], list)
+                and len(rows) == int(agent_tp) and isinstance(rows[0][0], (int,)) is False):
+            return rows
+
+        # 二维且 agent_tp==1：若维度与本地模型一致，自动包一层
+        if (int(agent_tp) == 1 and isinstance(rows, list)
+                and len(rows) == int(self.num_layers)
+                and all(isinstance(x, list) and len(x) == int(self.num_cache_entries) for x in rows)):
+            return [rows]
+
+        raise RuntimeError(
+            f"[ADD] kv_caches_base_addr shape incompatible with agent_tp={agent_tp}: "
+            f"outer_len={len(rows) if isinstance(rows, list) else 'NA'} "
+            f"(expect {agent_tp} or {self.num_layers} when tp==1)"
+        )
 
     def add_remote_agent(
             self,
