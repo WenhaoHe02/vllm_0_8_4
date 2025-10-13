@@ -39,9 +39,11 @@ except ImportError:
     logger.warning("NIXL is not available")
     NixlWrapper = None
 
+
 def _stable_hash_u32(s: str) -> int:
     # 稳定一致的 32-bit 哈希（跨进程/多机一致）
     return int(hashlib.sha1(s.encode("utf-8")).hexdigest()[:8], 16)
+
 
 def _pick_from_pool(pool: list[int], base_slot: int, worker_idx: int) -> int:
     # 空池时回落到当前 CUDA 设备（保底）
@@ -52,6 +54,7 @@ def _pick_from_pool(pool: list[int], base_slot: int, worker_idx: int) -> int:
             return 0
     # 以 base_slot 为起点，worker_idx 连续展开：0->pool[0], 1->pool[1], ...
     return int(pool[(base_slot + worker_idx) % len(pool)])
+
 
 class NixlMetadata(
     msgspec.Struct,
@@ -110,6 +113,9 @@ class DynamoNixlConnector:
         # ---- engine_id fingerprinting (strict check) ----
         self._engine_fingerprint = {}  # engine_id -> fp
         self._engine_agent_tp = {}     # engine_id -> tp size for check
+
+        # engine 是否做过“重型”准备（注册远端 agents 等）
+        self._engine_prepped = {}
 
         # ---- timing ----
         self._timing = _Timing(
@@ -272,8 +278,7 @@ class DynamoNixlConnector:
                                 "WRITE",
                                 src_hdl, local_idx,
                                 dst_hdl, remote_idx,
-                                "" if notify_payload is None else ""
-                                ,
+                                "",  # 中间批次不带通知
                                 backends=BACKENDS
                             )
                             self.nixl_wrapper.transfer(h)
@@ -583,7 +588,6 @@ class DynamoNixlConnector:
                 self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
                 self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
             )
-
 
         if _env_flag("NIXL_PUBLISH_SELF_MD", True):
             try:
@@ -1125,19 +1129,16 @@ class DynamoNixlConnector:
             num_blocks: int,
             kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
+        """
+        幂等 + 可复用：
+        - 不重复注册远端 agent / dlist，但**每个 rank** 都会补齐自己的 down/up 必要句柄与元数据。
+        - 环境变量映射优先：NIXL_MAP_VLLMWORKER / NIXL_MAP_PREFILLWORKER；否则可从 kv_caches_dev_ids 或 pool_len 回退。
+        """
         with self._timing.span("add_remote_agent"):
             agent_metadata = self._coerce_agent_metadata(agent_metadata)
-            # ---------- 幂等早退 ----------
-            if not hasattr(self, "_engine_ready"):
-                self._engine_ready = {}
-            if self._engine_ready.get(engine_id, False):
-                logger.info("[ADD][IDEMPOTENT] reuse engine=%s: src_keys=%s dst_keys=%s down=%s nb=%s",
-                            engine_id,
-                            list(self.src_xfer_side_handles.keys()),
-                            list(self.dst_xfer_side_handles.get(engine_id, {}).keys()),
-                            engine_id in self._downscale_info,
-                            self.dst_num_blocks.get(engine_id))
-                return self._remote_agents[engine_id]
+
+            # 记录对端 TP（每次都写，幂等）
+            self._tp_size[engine_id] = int(agent_tp)
 
             pid = os.getpid()
             try:
@@ -1149,11 +1150,8 @@ class DynamoNixlConnector:
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
                         engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
-            # 严格 engine_id 复用检查
+            # 严格 engine_id 复用检查（不同指纹报错/警告）
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
-
-            # 记录对端 TP
-            self._tp_size[engine_id] = int(agent_tp)
 
             # 持久化元数据（便于同机其它 rank 采用）
             try:
@@ -1168,20 +1166,12 @@ class DynamoNixlConnector:
             except Exception as e:
                 logger.debug("[ADD] _persist_remote_md_cache failed: %s", e)
 
-            # 注册远端 agent（只建一次）
-            agent_names: List[str] = []
-            for meta in agent_metadata:
-                agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
-            self._remote_agents[engine_id] = agent_names
-            logger.info("[ADD] remote_agents registered: dst_engine=%s count=%d names_sample=%s",
-                        engine_id, len(agent_names), self._peek(agent_names, 3))
-
-            # 保存对端元数据
+            # 保存对端元数据（幂等）
             self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
             self.kv_caches_dev_ids[engine_id] = kv_caches_dev_ids if kv_caches_dev_ids is not None else None
             loc_base = self.kv_caches_base_addr[engine_id]
 
-            # 形状一致性校验
+            # 基本形状校验（确保 rank/L/E 维度正确）
             if len(agent_metadata) != agent_tp:
                 raise RuntimeError(f"[ADD] agent_metadata len={len(agent_metadata)} != agent_tp={agent_tp}")
             if len(loc_base) != agent_tp:
@@ -1191,14 +1181,7 @@ class DynamoNixlConnector:
                 for L in range(self.num_layers):
                     assert len(loc_base[r][L]) == self.num_cache_entries
 
-            # ========= 环境变量映射（仅用于 DOWN 的“远端 dev_id”）=========
-            # 你可以用以下变量控制映射：
-            #   NIXL_MAP_VLLMWORKER="0:0,1:1,2:0"   # decode worker_idx -> pool_index
-            #   NIXL_MAP_PREFILLWORKER="0:0,1:1"    # 若将来需要，也保留同名对 prefill 的映射
-            # 说明：
-            #   - key 是 decode 端的 worker_idx（DOWN 场景就是 remote_rank）
-            #   - value 是“pool 索引”（不是 CUDA ordinal）
-            #   - 若没设置，且 kv_caches_dev_ids 也为空，就回退为简单的 (worker_idx % pool_len)
+            # ========= 环境变量映射（仅用于 DOWN 的“远端 dev_id/pool-index”）=========
             def _parse_map(env_name: str) -> dict[int, int]:
                 s = os.getenv(env_name, "").strip()
                 if not s:
@@ -1213,7 +1196,7 @@ class DynamoNixlConnector:
                     elif ":" in kv:
                         a, b = kv.split(":", 1)
                     else:
-                        logger.warning("[MAP] skip invalid pair %r in %s", kv, env_name);
+                        logger.warning("[MAP] skip invalid pair %r in %s", kv, env_name)
                         continue
                     try:
                         out[int(a.strip())] = int(b.strip())
@@ -1221,9 +1204,7 @@ class DynamoNixlConnector:
                         logger.warning("[MAP] skip invalid ints %r in %s", kv, env_name)
                 return out
 
-            # 用 pool 长度做边界检查（可选，不设置也不阻塞）
             def _pool_len_for_role(role: str) -> int:
-                # 只是为了校验映射是否越界；不参与选择
                 names = ["NIXL_POOL_VLLMWORKER", "NIXL_POOL_PREFILLWORKER", "NIXL_POOL"]
                 s = next((os.getenv(n) for n in names if os.getenv(n)), None)
                 if not s:
@@ -1240,7 +1221,7 @@ class DynamoNixlConnector:
             _pool_len_hint = _pool_len_for_role(remote_role)
 
             def _remote_pool_index_by_env_or_md(r_engine_id: str, r_idx: int, layer: int, entry_idx: int) -> int:
-                # 1) 有 kv_caches_dev_ids（pool 索引）时优先
+                # 1) kv_caches_dev_ids 优先（若提供）
                 devs = self.kv_caches_dev_ids.get(r_engine_id)
                 if devs is not None:
                     try:
@@ -1256,7 +1237,7 @@ class DynamoNixlConnector:
                         logger.warning("[MAP] %s maps %d->%d out of pool_len=%d",
                                        ENV_MAP_NAME, r_idx, v, _pool_len_hint)
                     return v
-                # 3) 回退：用 worker_idx 直接取模（可预测，且不再使用 hash/round-robin）
+                # 3) 回退：用 worker_idx 取模（可预测）
                 if _pool_len_hint:
                     v = r_idx % _pool_len_hint
                     logger.info("[MAP][FALLBACK] %s not set for %d, fallback pool_index=%d (pool_len=%d)",
@@ -1265,6 +1246,18 @@ class DynamoNixlConnector:
                 # 4) 无法得知 pool 长度时，兜底 0
                 logger.info("[MAP][FALLBACK] %s empty and pool_len unknown; use 0", ENV_MAP_NAME)
                 return 0
+
+            # ===== 注册远端 agent（重型步骤只做一次；但本 rank 的句柄/状态每次幂等补齐）=====
+            if not self._engine_prepped.get(engine_id, False):
+                agent_names: List[str] = []
+                for meta in agent_metadata:
+                    agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
+                self._remote_agents[engine_id] = agent_names
+                logger.info("[ADD] remote_agents registered: dst_engine=%s count=%d names_sample=%s",
+                            engine_id, len(agent_names), self._peek(agent_names, 3))
+                self._engine_prepped[engine_id] = True
+            else:
+                logger.info("[ADD][IDEMPOTENT] reuse remote_agents engine=%s", engine_id)
 
             # ===== 路径分岔 =====
             tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
@@ -1285,6 +1278,7 @@ class DynamoNixlConnector:
                 full_len = token_len_total * B
                 peer_off_tok = slot * token_len_local
 
+                # 每次都把 downscale_info 补齐（幂等）
                 self._downscale_info[engine_id] = {
                     "group_size": group_size,
                     "remote_rank": remote_rank,
@@ -1294,7 +1288,7 @@ class DynamoNixlConnector:
                     "token_granularity": True,
                 }
 
-                # 目的（decode）的 token 粒度单位数
+                # 目的（decode）的 token 粒度单位数（幂等）
                 self.dst_num_blocks[engine_id] = num_blocks * B
                 logger.info(
                     "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d peer_off_tok=%d",
@@ -1306,6 +1300,7 @@ class DynamoNixlConnector:
                     src_blocks = []
                     local_dev_id = self.rank
                     for layer in range(self.num_layers):
+                        # 本地是标准布局：每 layer 有 [K, V] 两段基址
                         for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V
                             for bid in range(self.num_blocks):
                                 base_block = base + bid * seg_len
@@ -1338,8 +1333,7 @@ class DynamoNixlConnector:
                         logger.debug("make_connection lazy: %s", e)
 
                 # READ-DOWN 本地目的 dlist（只建一次）—— 本地 dev_id 用 self.rank
-                if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles[
-                    "read_down_src"] is None:
+                if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles["read_down_src"] is None:
                     blocks_local = []
                     local_dev_id = self.rank
                     for layer in range(self.num_layers):
@@ -1380,14 +1374,14 @@ class DynamoNixlConnector:
                     list(self.dst_xfer_side_handles[engine_id].keys()),
                     self.dst_num_blocks[engine_id],
                     list(self.dst_xfer_side_handles[engine_id].keys()))
-                self._engine_ready[engine_id] = True
-                return agent_names
+                return self._remote_agents[engine_id]
 
-            # --------- UP / EQ（tp_multiplier > 0）---------  # ← 不改
+            # --------- UP / EQ（tp_multiplier > 0）---------
             assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
             logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
 
+            # src 侧 dlist（按 tp_multiplier 切分），只建一次
             if tp_multiplier not in self.src_xfer_side_handles or self.src_xfer_side_handles[tp_multiplier] is None:
                 blocks_data = []
                 for layer_id in range(self.num_layers):
@@ -1400,6 +1394,7 @@ class DynamoNixlConnector:
                 descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
                 self.src_xfer_side_handles[tp_multiplier] = self.nixl_wrapper.prep_xfer_dlist("", descs)
 
+            # 远端 dlist（每个 i 只建一次）
             self.dst_num_blocks[engine_id] = num_blocks
             if engine_id not in self.dst_xfer_side_handles:
                 self.dst_xfer_side_handles[engine_id] = {}
@@ -1428,9 +1423,7 @@ class DynamoNixlConnector:
                         list(self.src_xfer_side_handles.keys()),
                         list(self.dst_xfer_side_handles[engine_id].keys()),
                         self.dst_num_blocks[engine_id])
-
-            self._engine_ready[engine_id] = True
-            return agent_names
+            return self._remote_agents[engine_id]
 
     _last_done_log_ts = 0.0
 
