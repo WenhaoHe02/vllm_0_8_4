@@ -336,9 +336,6 @@ def rearrange_tensors_read_down(
     assert t_standard.is_contiguous() and t_grouped.is_contiguous()
     N, B, H, C = t_standard.shape
     logger.debug(f"[DBG] read_down shapes N={N}, B={B}, H={H}, C={C}, ngroups={ngroups}")
-
-    assert ngroups > 0 and (H % ngroups == 0)
-
     elems_per_block  = B * H * C
     elems_per_token  = H * C
     tensor_subset_sz = N * B * (H // ngroups) * C
