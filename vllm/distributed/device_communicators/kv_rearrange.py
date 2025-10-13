@@ -16,10 +16,8 @@
 import torch
 import triton
 import triton.language as tl
-import logging
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 @triton.jit
 def rearrange_kernel_read(
     t1_ptr,
