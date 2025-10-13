@@ -737,6 +737,9 @@ class DynamoNixlConnector:
     ) -> None:
         """把对端元数据写到本机共享缓存，供同机其它 rank 采纳。"""
         try:
+            # ★ 关键：写入前先规范化，确保是 List[bytes]，避免被按 int 序列还原
+            agent_metadata = self._coerce_agent_metadata(agent_metadata)
+
             payload = {
                 "engine_id": engine_id,
                 "agent_tp": int(agent_tp),
@@ -751,9 +754,33 @@ class DynamoNixlConnector:
             with open(tmp, "wb") as f:
                 f.write(b)
             os.replace(tmp, path)  # 原子替换
-            logger.debug("[MD-CACHE] persisted for engine=%s path=%s size=%dB", engine_id, path, len(b))
+            logger.debug("[MD-CACHE] persisted for engine=%s path=%s size=%dB",
+                         engine_id, path, len(b))
         except Exception as e:
             logger.debug("[MD-CACHE] persist failed: %s", e)
+
+    def _coerce_agent_metadata(self, md) -> List[bytes]:
+        """把各种可能的形式统一成 List[bytes]，避免把 bytes 当成可迭代的 int。"""
+        if md is None:
+            return []
+        # 单段：bytes / bytearray / memoryview
+        if isinstance(md, (bytes, bytearray, memoryview)):
+            return [bytes(md)]
+        # 列表/元组：逐个转成 bytes
+        if isinstance(md, (list, tuple)):
+            out = []
+            for x in md:
+                if isinstance(x, (bytes, bytearray, memoryview)):
+                    out.append(bytes(x))
+                else:
+                    # 某些序列化器可能给成了 list[int]；兜底拼成 bytes
+                    if isinstance(x, list) and all(isinstance(i, int) for i in x):
+                        out.append(bytes(x))
+                    else:
+                        raise TypeError(f"agent_metadata elem must be bytes-like, got {type(x).__name__}")
+            return out
+        # 其它类型不接受（如 str 路径不在此通道使用）
+        raise TypeError(f"agent_metadata must be bytes or list of bytes, got {type(md).__name__}")
 
     def _adopt_remote_md_from_cache(self, engine_id: str) -> bool:
         """如果还没拿到对端元数据，尝试从共享缓存读取并调用 add_remote_agent。"""
@@ -761,15 +788,20 @@ class DynamoNixlConnector:
             path = self._md_cache_path(engine_id)
             if not os.path.exists(path):
                 return False
+
             with open(path, "rb") as f:
                 data = msgspec.msgpack.decode(f.read())
+
             if data.get("engine_id") != engine_id:
                 return False
+
             agent_tp = int(data["agent_tp"])
-            # 可能已就绪：再调一次也安全，内部有一致性检查
+            # ★ 关键：强制把 agent_metadata 变成 List[bytes]
+            agent_metadata = self._coerce_agent_metadata(data.get("agent_metadata"))
+
             self.add_remote_agent(
                 engine_id=data["engine_id"],
-                agent_metadata=data["agent_metadata"],
+                agent_metadata=agent_metadata,
                 agent_tp=agent_tp,
                 kv_caches_base_addr=data["kv_caches_base_addr"],
                 num_blocks=int(data["num_blocks"]),
@@ -1094,6 +1126,7 @@ class DynamoNixlConnector:
             kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
         with self._timing.span("add_remote_agent"):
+            agent_metadata = self._coerce_agent_metadata(agent_metadata)
             # ---------- 幂等早退 ----------
             if not hasattr(self, "_engine_ready"):
                 self._engine_ready = {}
