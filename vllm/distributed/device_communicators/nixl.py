@@ -328,8 +328,8 @@ class DynamoNixlConnector:
             raise RuntimeError(msg)
 
         if (dst_engine_id not in self.dst_xfer_side_handles or
-            "read_down_dst" not in self.dst_xfer_side_handles[dst_engine_id] or
-            self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is None):
+                "read_down_dst" not in self.dst_xfer_side_handles[dst_engine_id] or
+                self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is None):
             msg = (
                 f"[READ-DOWN] missing remote READ src handle: "
                 f"dst_engine={dst_engine_id} local_rank={self.rank} "
@@ -339,7 +339,7 @@ class DynamoNixlConnector:
             logger.error(msg)
             raise RuntimeError(msg)
 
-        dst_handle = self.src_xfer_side_handles["read_down_src"]      # 本地（prefill）作为 READ 目的地（标准布局）
+        dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地（prefill）作为 READ 目的地（标准布局）
         src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端（decode）作为 READ 来源（按块）
 
         def _ids_blockwise(num_blocks_total, block_ids):
@@ -351,6 +351,7 @@ class DynamoNixlConnector:
                                    + entry * num_blocks_total + b)
             return ids
 
+        # ==== 传输 ====
         num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]
         src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)
         dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)
@@ -371,18 +372,67 @@ class DynamoNixlConnector:
                 raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
             time.sleep(0.001)
 
-        ngroups = self._tp_size[self.engine_id] // max(1, self._tp_size[dst_engine_id])
+        # ==== 回读后的“分组->标准”重排（only when we downscaled）====
+        # 原先这里的 ngroups 用 tp_size 比值推导；现在直接使用 add_remote_agent() 已经确定的 group_size
+        ngroups = int(down.get("group_size", 1))
         if ngroups <= 1:
             return
 
+        # 修复：这里本来错把 staging_ranges 取成了 local_block_ids，导致某些 prompt 下对不齐
         local_ranges = self._get_ranges(local_block_ids)
-        staging_ranges = self._get_ranges(local_block_ids)
+        staging_ranges = self._get_ranges(staging_block_ids)
+
+        # 选择用于整除校验的“重排维度”：
+        #   优先使用 block_size 维（token 维，和 DOWN 的写入粒度一致）
+        #   若不整除，再尝试 num_heads 维
+        #   都不行则降级为 1（跳过重排，至少不崩；可用 NIXL_RD_REARRANGE_STRICT=1 强制报错）
+        from math import gcd
+        prefer_heads = os.getenv("NIXL_RD_DIM", "TOK").upper() == "HEADS"  # 可选：NIXL_RD_DIM=HEADS 切换偏好
+        B = int(self.block_size or 0)
+        Hh = int(self.num_heads or 0)
+
+        def _pick_ngroups_eff():
+            cand = []
+            if not prefer_heads:
+                cand.append(("TOK", B))
+                cand.append(("HEADS", Hh))
+            else:
+                cand.append(("HEADS", Hh))
+                cand.append(("TOK", B))
+            for name, dim in cand:
+                if dim and ngroups > 0 and (dim % ngroups == 0):
+                    return ngroups, name, dim
+                if dim and ngroups > 0:
+                    g = gcd(dim, ngroups)
+                    if g > 1:
+                        return g, name, dim
+            return 1, "NONE", 0
+
+        ng_eff, dim_name, dim_val = _pick_ngroups_eff()
+        if ng_eff <= 1:
+            if os.getenv("NIXL_RD_REARRANGE_STRICT", "0") == "1":
+                raise AssertionError(
+                    f"[READ-DOWN] cannot find divisible dim for rearrange: "
+                    f"ngroups={ngroups} block_size={B} num_heads={Hh}"
+                )
+            logger.warning(
+                "[READ-DOWN] skip rearrange (use ngroups=1): ngroups=%d block_size=%d num_heads=%d",
+                ngroups, B, Hh
+            )
+            return
+
+        logger.debug("[READ-DOWN] rearrange via %s dim=%d ngroups_eff=%d (orig=%d)",
+                     dim_name, dim_val, ng_eff, ngroups)
+
+        # 真正重排
         for (l0, l1), (s0, s1) in zip(local_ranges, staging_ranges):
             for kv_cache in self.kv_caches:
                 for cache in kv_cache:
                     t_std = cache[s0: s1 + 1].contiguous()
                     t_grp = cache[l0: l1 + 1].contiguous()
-                    rearrange_tensors_read_down(t_std, t_grp, ngroups)
+                    # 注意：rearrange_tensors_read_down 内部会 assert 维度可整除
+                    # 这里传 ng_eff（已保证整除）
+                    rearrange_tensors_read_down(t_std, t_grp, ng_eff)
                     cache[l0: l1 + 1].copy_(t_grp)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
