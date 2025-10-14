@@ -357,12 +357,13 @@ class DynamoNixlConnector:
         down = self._downscale_info[dst_engine_id]
         assert down is not None, "[READ-DOWN] downscale info missing"
 
-        # —— 句柄存在性（你日志里 keys=[1] 就是缺了这个）
+        # 句柄存在性检查
         if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles["read_down_src"] is None:
             msg = (f"[READ-DOWN] missing local READ dst (staging) handle: "
                    f"engine={self.engine_id} local_rank={self.rank} keys={list(self.src_xfer_side_handles.keys())}")
-            logger.error(msg)
+            logger.error(msg);
             raise RuntimeError(msg)
+
         if (dst_engine_id not in self.dst_xfer_side_handles or
                 "read_down_dst" not in self.dst_xfer_side_handles[dst_engine_id] or
                 self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is None):
@@ -370,56 +371,68 @@ class DynamoNixlConnector:
                    f"dst_engine={dst_engine_id} local_rank={self.rank} "
                    f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
                    f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}")
-            logger.error(msg)
+            logger.error(msg);
             raise RuntimeError(msg)
 
-        dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地 staging（标准布局）
-        src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端 decode（标准布局）
+        dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地（prefill，staging，token 粒度）
+        src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端（decode，token 粒度）
 
-        def _ids_blockwise(num_blocks_total, block_ids):
+        # —— token 粒度索引（与句柄构建顺序一致）
+        token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
+        token_ids_local = self._expand_blocks_to_tokens(staging_block_ids)
+        assert len(token_ids_remote) == len(token_ids_local)
+
+        def _ids_tokenwise(num_tokens_total, token_ids):
             ids = []
             for layer in range(self.num_layers):
                 for entry in range(self.num_cache_entries):  # K / V
-                    for b in block_ids:
-                        ids.append(layer * self.num_cache_entries * num_blocks_total
-                                   + entry * num_blocks_total + b)
+                    base = layer * self.num_cache_entries * num_tokens_total + entry * num_tokens_total
+                    for t in token_ids:
+                        ids.append(base + t)
             return ids
 
-        num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]
-        src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)  # 远端块索引
-        dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)  # 本地 staging 块索引（标准）
+        num_tokens_remote = self.dst_num_blocks_read[dst_engine_id]  # = num_blocks * B
+        src_desc_ids = _ids_tokenwise(num_tokens_remote, token_ids_remote)
+        dst_desc_ids = _ids_tokenwise(self.num_blocks * int(self.block_size), token_ids_local)
+        logger.debug("[READ-DOWN] desc_ids(len) src=%d dst=%d", len(src_desc_ids), len(dst_desc_ids))
 
-        logger.debug("[READ-DOWN] desc_ids len src=%d dst=%d", len(src_desc_ids), len(dst_desc_ids))
-
-        # —— 先把 decode 的标准布局搬到本地 staging（块粒度，一次性 READ）
+        # —— 传输（READ，token 粒度）
         h = self.nixl_wrapper.make_prepped_xfer("READ", dst_handle, dst_desc_ids, src_handle, src_desc_ids, "")
         self.nixl_wrapper.transfer(h)
         while True:
             st = self.nixl_wrapper.check_xfer_state(h)
-            if st == "DONE":
-                break
-            if st != "PROC":
-                raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
+            if st == "DONE": break
+            if st != "PROC": raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
             time.sleep(0.001)
 
-        # —— 分组大小（prefill TP / decode TP）
-        ngroups = int(down.get("group_size", 1))
-        if ngroups <= 1:
+        # —— staging(标准) -> local(分组) 重排（逐块调用你的 kernel，避免 OOM）
+        ngroups_cfg = int(down.get("group_size", 1))
+        if ngroups_cfg <= 1:
             return
 
-        # —— 逐块重排：t_standard=staging 的那一块；t_grouped=最终 local 那一块
-        #     每次只做 1 个 block，避免对大范围使用 .contiguous() 造成显存峰值暴涨
-        assert len(local_block_ids) == len(staging_block_ids) == len(remote_block_ids)
-        for l_bid, s_bid in zip(local_block_ids, staging_block_ids):
-            for kv_cache in self.kv_caches:  # 遍历每一层的 (K, V)
-                for cache in kv_cache:  # cache 形状：(num_blocks, B, H, C)
-                    # 取单块视图并 copy 为 contiguous（你的 kernel 要求 contiguous）
-                    t_std = cache[s_bid:s_bid + 1].contiguous()  # staging 的“标准布局”单块 → H = 全 H_std
-                    t_grp = cache[l_bid:l_bid + 1].contiguous()  # 目标的“分组布局”单块
-                    # 调用你的核：standard -> grouped
-                    rearrange_tensors_read_down(t_std, t_grp, ngroups)
-                    # 把重排后的块写回目标位置
-                    cache[l_bid:l_bid + 1].copy_(t_grp)
+        # 确保 local/staging 区间一一对应
+        local_ranges0 = self._get_ranges(local_block_ids)
+        staging_ranges0 = self._get_ranges(staging_block_ids)
+        local_ranges, staging_ranges = self._get_same_length_ranges(local_ranges0, staging_ranges0)
+
+        for (l0, l1), (s0, s1) in zip(local_ranges, staging_ranges):
+            for kv_cache in self.kv_caches:  # 每层的 (K, V)
+                for cache in kv_cache:  # cache 形状：(num_blocks, B, H_local, C)
+                    for bid_off in range(0, (l1 - l0 + 1)):
+                        l_bid = l0 + bid_off
+                        s_bid = s0 + bid_off
+                        t_std = cache[s_bid:s_bid + 1].contiguous()  # staging（标准视角）
+                        t_grp = cache[l_bid:l_bid + 1].contiguous()  # 目标（分组视角）
+
+                        # 守护：以实际 H 为准选择 ngroups（防越界）
+                        H_act = int(t_std.shape[2])
+                        g_eff = ngroups_cfg if (H_act % ngroups_cfg == 0) else 1
+                        if g_eff != ngroups_cfg:
+                            logger.warning("[READ-DOWN] adjust ngroups: cfg=%d -> eff=%d (H=%d)", ngroups_cfg, g_eff,
+                                           H_act)
+
+                        rearrange_tensors_read_down(t_std, t_grp, g_eff)
+                        cache[l_bid:l_bid + 1].copy_(t_grp)
 
     def _local_token_desc_ids(self, token_ids: List[int]) -> List[int]:
         per_entry = self.num_blocks * self.block_size
@@ -1326,104 +1339,88 @@ class DynamoNixlConnector:
             logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                         tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
+            # --------- DOWN（prefill -> decode，tp_multiplier == 0）---------
             if tp_multiplier == 0 and not self._is_mla:
                 group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
                 remote_rank = self.rank // group_size
                 peer_idx = self.rank % group_size
+                is_leader = (peer_idx == 0)
 
                 B = int(self.block_size)
-                token_len_local = self.block_len // B
+                # 本地单 token 字节数（本 rank 的 H）
+                token_len_local = (self.block_len // B)
+                # 对端 decode 单 token 字节数（group 汇总后的整块大小 / B）
                 token_len_total = token_len_local * group_size
-                seg_len = token_len_local * B
-                full_len = token_len_total * B
+                seg_len_local = token_len_local * B
+                full_len_remote = token_len_total * B
                 peer_off_tok = peer_idx * token_len_local
 
                 self._downscale_info[engine_id] = {
                     "group_size": group_size,
                     "remote_rank": remote_rank,
                     "peer_idx": peer_idx,
-                    "notify_leader": (peer_idx == 0),
+                    "notify_leader": is_leader,
+                    "perm": None,
+                    "token_granularity": True,
                 }
-                # —— decode 端的“token 粒度” dlist（WRITE-DOWN 用）
-                self.dst_num_blocks[engine_id] = num_blocks * B
 
-                # src（本地 token 粒度，WRITE-DOWN 用；键 1 已存在就略过）
-                if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                    src_blocks = []
-                    local_dev_id = self.rank
-                    for layer in range(self.num_layers):
-                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K / V
-                            for bid in range(self.num_blocks):
-                                base_block = base + bid * seg_len
-                                for t in range(B):
-                                    src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
-                    desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
-                    self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", desc)
+                # ========== WRITE-DOWN 句柄（你原来就有，略） ==========
+                # ...（保持你已有的 token 粒度 src/dst 构建）...
 
-                # dst（远端 token 粒度，WRITE-DOWN 用）
-                if engine_id not in self.dst_xfer_side_handles:
-                    self.dst_xfer_side_handles[engine_id] = {}
-                if remote_rank not in self.dst_xfer_side_handles[engine_id]:
-                    dst_blocks = []
-                    for layer in range(self.num_layers):
-                        layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
-                        for entry_idx, rbase in enumerate(layer_bases):
-                            r_pool_idx = 0  # 如你有 pool 映射逻辑，这里可复用你原来的函数
-                            for bid in range(num_blocks):
-                                base_block = rbase + bid * full_len
-                                for t in range(B):
-                                    dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
-                                                       token_len_local, r_pool_idx))
-                    desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
-                    self.dst_xfer_side_handles[engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
-                        self._remote_agents[engine_id][remote_rank], desc)
-                    try:
-                        self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
-                    except Exception as e:
-                        logger.debug("make_connection lazy: %s", e)
-
-                # ========= READ-DOWN 的句柄（块粒度，标准布局，**必须**建立）=========
-                # 本地目的（staging，标准布局，每块大小 = self.block_len）
+                # ========== READ-DOWN 句柄（关键：也要 token 粒度） ==========
+                # 本地目的 dlist：每 token 一个条目，长度 token_len_local
                 if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles[
                     "read_down_src"] is None:
                     blocks_local = []
                     local_dev_id = self.rank
                     for layer in range(self.num_layers):
-                        for base in self.kv_caches_base_addr[self.engine_id][layer]:
+                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K / V
                             for bid in range(self.num_blocks):
-                                blocks_local.append((base + bid * self.block_len, self.block_len, local_dev_id))
+                                base_block = base + bid * seg_len_local
+                                for t in range(B):
+                                    blocks_local.append((base_block + t * token_len_local,
+                                                         token_len_local, local_dev_id))
                     descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
                     self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
 
-                # 远端来源（decode，标准布局，块粒度）
+                # 远端来源 dlist：每 token 一个条目，起点需加 peer_off_tok
+                if engine_id not in self.dst_xfer_side_handles:
+                    self.dst_xfer_side_handles[engine_id] = {}
                 if "read_down_dst" not in self.dst_xfer_side_handles[engine_id]:
                     blocks_remote = []
                     for layer in range(self.num_layers):
                         layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [K_base, V_base]
                         for entry_idx, rbase in enumerate(layer_bases):
-                            r_pool_idx = 0
+                            r_pool_idx = remote_rank  # 如有 pool 映射，替换为你的映射函数
                             for bid in range(num_blocks):
-                                blocks_remote.append((rbase + bid * self.block_len, self.block_len, r_pool_idx))
+                                base_block = rbase + bid * full_len_remote
+                                for t in range(B):
+                                    blocks_remote.append((base_block + t * token_len_total + peer_off_tok,
+                                                          token_len_local, r_pool_idx))
                     descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
                     self.dst_xfer_side_handles[engine_id]["read_down_dst"] = self.nixl_wrapper.prep_xfer_dlist(
-                        self._remote_agents[engine_id][remote_rank], descs_remote)
+                        self._remote_agents[engine_id][remote_rank], descs_remote
+                    )
                     try:
                         self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
                     except Exception as e:
                         logger.debug("[ADD][READ-DOWN] make_connection lazy: %s", e)
 
-                # 记录 decode 端“块”数量（READ-DOWN 用）
+                # READ-DOWN 的“单位数”= 按 token 粒度
                 if not hasattr(self, "dst_num_blocks_read"):
                     self.dst_num_blocks_read = {}
-                self.dst_num_blocks_read[engine_id] = num_blocks
+                self.dst_num_blocks_read[engine_id] = num_blocks * B
 
                 logger.info(
-                    "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d src_keys=%s dst_keys=%s dst_units(token)=%s read_down_keys=%s",
+                    "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d "
+                    "src_keys=%s dst_keys=%s read_down_keys=%s dst_units(token)=%s",
                     engine_id, self.rank, remote_rank,
                     list(self.src_xfer_side_handles.keys()),
                     list(self.dst_xfer_side_handles[engine_id].keys()),
-                    self.dst_num_blocks[engine_id],
-                    list(self.dst_xfer_side_handles[engine_id].keys()))
+                    list(self.dst_xfer_side_handles[engine_id].keys()),
+                    self.dst_num_blocks[engine_id]
+                )
+
                 self._engine_ready[engine_id] = True
                 return agent_names
 
