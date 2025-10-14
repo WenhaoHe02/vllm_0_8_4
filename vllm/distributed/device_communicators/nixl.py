@@ -1206,9 +1206,8 @@ class DynamoNixlConnector:
             kv_caches_dev_ids: Optional[List[List[List[int]]]] = None,
     ):
         with self._timing.span("add_remote_agent"):
+            # ---- 统一 & 幂等早退 ----
             agent_metadata = self._coerce_agent_metadata(agent_metadata)
-
-            # ---------- 幂等早退 ----------
             if not hasattr(self, "_engine_ready"):
                 self._engine_ready = {}
             if self._engine_ready.get(engine_id, False):
@@ -1230,13 +1229,13 @@ class DynamoNixlConnector:
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
                         engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
-            # 严格 engine_id 复用检查
+            # ---- 严格 engine_id 复用检查 ----
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
             # 记录对端 TP
             self._tp_size[engine_id] = int(agent_tp)
 
-            # 持久化元数据（便于同机其它 rank 采用）
+            # 持久化元数据（便于同机其它 rank “收养”）
             try:
                 self._persist_remote_md_cache(
                     engine_id=engine_id,
@@ -1249,7 +1248,7 @@ class DynamoNixlConnector:
             except Exception as e:
                 logger.debug("[ADD] _persist_remote_md_cache failed: %s", e)
 
-            # 注册远端 agent（只建一次）
+            # 注册远端 agents
             agent_names: List[str] = []
             for meta in agent_metadata:
                 agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
@@ -1272,7 +1271,7 @@ class DynamoNixlConnector:
                 for L in range(self.num_layers):
                     assert len(loc_base[r][L]) == self.num_cache_entries
 
-            # ========= 远端 dev_id 映射工具 =========
+            # ========= 环境变量到 pool-index 的映射（仅用于 DOWN 场景远端 dev_id）=========
             def _parse_map(env_name: str) -> dict[int, int]:
                 s = os.getenv(env_name, "").strip()
                 if not s:
@@ -1334,69 +1333,116 @@ class DynamoNixlConnector:
                 logger.info("[MAP][FALLBACK] %s empty and pool_len unknown; use 0", ENV_MAP_NAME)
                 return 0
 
-            # ====== 路径分岔 ======
+            # ===== 路径分岔 =====
             tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
             logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
                         tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
-            # --------- DOWN（prefill -> decode，tp_multiplier == 0）---------
+            # --------- DOWN（prefill -> decode，tp_multiplier == 0，非 MLA）---------
             if tp_multiplier == 0 and not self._is_mla:
+                # 组信息
                 group_size = self._tp_size[self.engine_id] // max(1, self._tp_size[engine_id])
                 remote_rank = self.rank // group_size
                 peer_idx = self.rank % group_size
-                is_leader = (peer_idx == 0)
+                slot = peer_idx
 
+                # 基本度量（B=block_size=每块token数；每 token 的步长=block_len/B）
                 B = int(self.block_size)
-                # 本地单 token 字节数（本 rank 的 H）
-                token_len_local = (self.block_len // B)
-                # 对端 decode 单 token 字节数（group 汇总后的整块大小 / B）
+                token_len_local = self.block_len // B  # 每 token 字节数（按 entry 拼起来）
                 token_len_total = token_len_local * group_size
-                seg_len_local = token_len_local * B
-                full_len_remote = token_len_total * B
-                peer_off_tok = peer_idx * token_len_local
+                seg_len = token_len_local * B  # 每块字节数（=block_len）
+                full_len = token_len_total * B  # 远端完整块（聚合所有 peer）的字节数
+                peer_off_tok = slot * token_len_local  # 我方 peer 在 token 维度的偏移
 
+                # 记下 downscale 信息（供 READ/WRITE-DOWN 使用）
                 self._downscale_info[engine_id] = {
                     "group_size": group_size,
                     "remote_rank": remote_rank,
                     "peer_idx": peer_idx,
-                    "notify_leader": is_leader,
+                    "notify_leader": (peer_idx == 0),
                     "perm": None,
                     "token_granularity": True,
                 }
 
-                # ========== WRITE-DOWN 句柄（你原来就有，略） ==========
-                # ...（保持你已有的 token 粒度 src/dst 构建）...
+                # ============ 关键初始化：目的单位数 ============
+                # WRITE-DOWN：以“token”为单位（每块 B 个 token）
+                if not hasattr(self, "dst_num_blocks"):
+                    self.dst_num_blocks = {}
+                self.dst_num_blocks[engine_id] = int(num_blocks) * int(B)
 
-                # ========== READ-DOWN 句柄（关键：也要 token 粒度） ==========
-                # 本地目的 dlist：每 token 一个条目，长度 token_len_local
+                # READ-DOWN：以“块”为单位（READ 是 _ids_blockwise）
+                if not hasattr(self, "dst_num_blocks_read"):
+                    self.dst_num_blocks_read = {}
+                self.dst_num_blocks_read[engine_id] = int(num_blocks)
+
+                logger.info(
+                    "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d peer_off_tok=%d",
+                    group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len, peer_off_tok
+                )
+
+                # ============ 句柄 1：WRITE-DOWN 源（本地 token 粒度，key=1） ============
+                if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
+                    src_blocks = []
+                    local_dev_id = self.rank
+                    for layer in range(self.num_layers):
+                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K、V 两个 entry
+                            for bid in range(self.num_blocks):
+                                base_block = base + bid * seg_len
+                                for t in range(B):
+                                    # 每个 token 一个段
+                                    src_blocks.append((base_block + t * token_len_local, token_len_local, local_dev_id))
+                    desc = self.nixl_wrapper.get_xfer_descs(src_blocks, "VRAM")
+                    self.src_xfer_side_handles[1] = self.nixl_wrapper.prep_xfer_dlist("", desc)
+
+                # ============ 句柄 2：WRITE-DOWN 目的（远端 token 粒度，key=remote_rank） ============
+                if engine_id not in self.dst_xfer_side_handles:
+                    self.dst_xfer_side_handles[engine_id] = {}
+                if remote_rank not in self.dst_xfer_side_handles[engine_id] or self.dst_xfer_side_handles[engine_id][
+                    remote_rank] is None:
+                    dst_blocks = []
+                    for layer in range(self.num_layers):
+                        layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]
+                        for entry_idx, rbase in enumerate(layer_bases):  # K、V
+                            r_pool_idx = _remote_pool_index_by_env_or_md(engine_id, remote_rank, layer, entry_idx)
+                            for bid in range(num_blocks):
+                                base_block = rbase + bid * full_len
+                                for t in range(B):
+                                    # 远端按完整块组织；本 peer 只写自己负责的 token 子段
+                                    dst_blocks.append((base_block + t * token_len_total + peer_off_tok,
+                                                       token_len_local, r_pool_idx))
+                    desc = self.nixl_wrapper.get_xfer_descs(dst_blocks, "VRAM")
+                    self.dst_xfer_side_handles[engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
+                        self._remote_agents[engine_id][remote_rank], desc
+                    )
+                    try:
+                        self.nixl_wrapper.make_connection(self._remote_agents[engine_id][remote_rank])
+                    except Exception as e:
+                        logger.debug("make_connection lazy: %s", e)
+
+                # ============ 句柄 3：READ-DOWN 本地目的（staging，块粒度，key='read_down_src'） ============
                 if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles[
                     "read_down_src"] is None:
                     blocks_local = []
                     local_dev_id = self.rank
                     for layer in range(self.num_layers):
-                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # K / V
+                        for base in self.kv_caches_base_addr[self.engine_id][layer]:  # 本地 K/V 基址
                             for bid in range(self.num_blocks):
-                                base_block = base + bid * seg_len_local
-                                for t in range(B):
-                                    blocks_local.append((base_block + t * token_len_local,
-                                                         token_len_local, local_dev_id))
+                                block_offset = bid * self.block_len  # = seg_len
+                                blocks_local.append((base + block_offset, self.block_len, local_dev_id))
                     descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
                     self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
 
-                # 远端来源 dlist：每 token 一个条目，起点需加 peer_off_tok
-                if engine_id not in self.dst_xfer_side_handles:
-                    self.dst_xfer_side_handles[engine_id] = {}
-                if "read_down_dst" not in self.dst_xfer_side_handles[engine_id]:
+                # ============ 句柄 4：READ-DOWN 远端来源（块粒度，key='read_down_dst'） ============
+                if "read_down_dst" not in self.dst_xfer_side_handles[engine_id] or \
+                        self.dst_xfer_side_handles[engine_id]["read_down_dst"] is None:
                     blocks_remote = []
                     for layer in range(self.num_layers):
                         layer_bases = self.kv_caches_base_addr[engine_id][remote_rank][layer]  # [K_base, V_base]
                         for entry_idx, rbase in enumerate(layer_bases):
-                            r_pool_idx = remote_rank  # 如有 pool 映射，替换为你的映射函数
+                            r_pool_idx = _remote_pool_index_by_env_or_md(engine_id, remote_rank, layer, entry_idx)
                             for bid in range(num_blocks):
-                                base_block = rbase + bid * full_len_remote
-                                for t in range(B):
-                                    blocks_remote.append((base_block + t * token_len_total + peer_off_tok,
-                                                          token_len_local, r_pool_idx))
+                                block_offset = bid * self.block_len
+                                blocks_remote.append((rbase + block_offset, self.block_len, r_pool_idx))
                     descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
                     self.dst_xfer_side_handles[engine_id]["read_down_dst"] = self.nixl_wrapper.prep_xfer_dlist(
                         self._remote_agents[engine_id][remote_rank], descs_remote
@@ -1406,21 +1452,15 @@ class DynamoNixlConnector:
                     except Exception as e:
                         logger.debug("[ADD][READ-DOWN] make_connection lazy: %s", e)
 
-                # READ-DOWN 的“单位数”= 按 token 粒度
-                if not hasattr(self, "dst_num_blocks_read"):
-                    self.dst_num_blocks_read = {}
-                self.dst_num_blocks_read[engine_id] = num_blocks * B
-
                 logger.info(
-                    "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d "
-                    "src_keys=%s dst_keys=%s read_down_keys=%s dst_units(token)=%s",
+                    "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d src_keys=%s dst_keys=%s "
+                    "dst_units(WRITE tokens)=%s read_down_keys=%s",
                     engine_id, self.rank, remote_rank,
                     list(self.src_xfer_side_handles.keys()),
                     list(self.dst_xfer_side_handles[engine_id].keys()),
-                    list(self.dst_xfer_side_handles[engine_id].keys()),
-                    self.dst_num_blocks[engine_id]
+                    self.dst_num_blocks[engine_id],
+                    list(self.dst_xfer_side_handles[engine_id].keys())
                 )
-
                 self._engine_ready[engine_id] = True
                 return agent_names
 
@@ -1429,6 +1469,7 @@ class DynamoNixlConnector:
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
             logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
 
+            # 源 dlist（本地）
             if tp_multiplier not in self.src_xfer_side_handles or self.src_xfer_side_handles[tp_multiplier] is None:
                 blocks_data = []
                 for layer_id in range(self.num_layers):
@@ -1441,6 +1482,7 @@ class DynamoNixlConnector:
                 descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
                 self.src_xfer_side_handles[tp_multiplier] = self.nixl_wrapper.prep_xfer_dlist("", descs)
 
+            # 目的 dlist（远端）
             self.dst_num_blocks[engine_id] = num_blocks
             if engine_id not in self.dst_xfer_side_handles:
                 self.dst_xfer_side_handles[engine_id] = {}
