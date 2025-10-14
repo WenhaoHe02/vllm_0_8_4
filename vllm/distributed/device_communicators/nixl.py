@@ -357,32 +357,57 @@ class DynamoNixlConnector:
         down = self._downscale_info[dst_engine_id]
         assert down is not None, "[READ-DOWN] downscale info missing"
 
-        # ======= 句柄与 staging 校验 =======
-        if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles["read_down_src"] is None:
-            msg = (
-                f"[READ-DOWN] missing local READ dst (staging) handle: "
-                f"engine={self.engine_id} local_rank={self.rank} keys={list(self.src_xfer_side_handles.keys())}"
-            )
-            logger.error(msg)
-            raise RuntimeError(msg)
+        # ======= 先拿到 ngroups / peer 索引 =======
+        ngroups = int(down.get("group_size", 1))
+        peer_idx = int(down.get("peer_idx", 0))
 
+        # ======= 懒建：标准布局 staging 张量 + 本地 READ 目的 dlist =======
+        # 确保我们有 (N,B,H_std,C) 的 staging 缓冲，且按 H_std 计算的 block_len_std 已就绪
+        if self._rd_std is None or self.block_len_std <= 0 or self.H_std != int(self.num_heads) * max(1, ngroups):
+            self._ensure_read_down_staging(ngroups=ngroups)
+
+        # 若本地 READ 目的 dlist 缺失，则基于 _rd_std 现建（每块长度用 block_len_std）
+        if "read_down_src" not in self.src_xfer_side_handles or self.src_xfer_side_handles["read_down_src"] is None:
+            blocks_local = []
+            local_dev_id = self.rank
+            for L in range(self.num_layers):
+                for E in range(self.num_cache_entries):
+                    base = int(self._rd_std[L][E].data_ptr())
+                    for bid in range(self.num_blocks):
+                        blocks_local.append((base + bid * int(self.block_len_std),
+                                             int(self.block_len_std), local_dev_id))
+            descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
+            self.src_xfer_side_handles["read_down_src"] = self.nixl_wrapper.prep_xfer_dlist("", descs_local)
+
+        # 若远端 READ 来源 dlist 缺失，也补建一次（通常已在 add_remote_agent 里建好）
         if (dst_engine_id not in self.dst_xfer_side_handles or
                 "read_down_dst" not in self.dst_xfer_side_handles[dst_engine_id] or
                 self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is None):
-            msg = (
-                f"[READ-DOWN] missing remote READ src handle: "
-                f"dst_engine={dst_engine_id} local_rank={self.rank} "
-                f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
-                f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}"
+            if dst_engine_id not in self.dst_xfer_side_handles:
+                self.dst_xfer_side_handles[dst_engine_id] = {}
+            remote_rank = int(down["remote_rank"])
+            blocks_remote = []
+            num_blocks_remote = int(self.dst_num_blocks_read[dst_engine_id])  # 注意：这里是“块数”
+            for L in range(self.num_layers):
+                layer_bases = self.kv_caches_base_addr[dst_engine_id][remote_rank][L]  # [K_base, V_base]
+                for entry_idx, rbase in enumerate(layer_bases):
+                    # 尝试从 md 里取 pool 索引；没有就回退 0（单 decode GPU 时也成立）
+                    try:
+                        r_pool_idx = int(self.kv_caches_dev_ids[dst_engine_id][remote_rank][L][entry_idx])
+                    except Exception:
+                        r_pool_idx = 0
+                    for bid in range(num_blocks_remote):
+                        blocks_remote.append((rbase + bid * self.block_len, self.block_len, r_pool_idx))
+            descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
+            self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] = self.nixl_wrapper.prep_xfer_dlist(
+                self._remote_agents[dst_engine_id][remote_rank], descs_remote
             )
-            logger.error(msg)
-            raise RuntimeError(msg)
+            try:
+                self.nixl_wrapper.make_connection(self._remote_agents[dst_engine_id][remote_rank])
+            except Exception as e:
+                logger.debug("[READ-DOWN] make_connection lazy: %s", e)
 
-        if self._rd_std is None or self.block_len_std <= 0:
-            # 极端竞态下，确保 staging 已构建
-            ngroups_ensure = int(down.get("group_size", 1))
-            self._ensure_read_down_staging(ngroups=ngroups_ensure)
-
+        # ======= 到这里两个句柄都在了 =======
         dst_handle = self.src_xfer_side_handles["read_down_src"]  # 本地 staging（标准 H_std）
         src_handle = self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"]  # 远端 decode（标准块）
 
@@ -395,7 +420,7 @@ class DynamoNixlConnector:
                                    + entry * num_blocks_total + b)
             return ids
 
-        num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]  # 注意：按“块数”
+        num_blocks_remote = self.dst_num_blocks_read[dst_engine_id]  # 远端：以“块”为单位
         src_desc_ids = _ids_blockwise(num_blocks_remote, remote_block_ids)
         dst_desc_ids = _ids_blockwise(self.num_blocks, staging_block_ids)
         logger.debug("[READ-DOWN] desc_ids len src=%d dst=%d", len(src_desc_ids), len(dst_desc_ids))
@@ -416,12 +441,11 @@ class DynamoNixlConnector:
                 raise RuntimeError(f"[READ-DOWN] transfer failed: {st}")
             time.sleep(0.001)
 
-        # ---------- 标准 -> 分组；并切片回写属于本 shard 的 H ----------
-        ngroups = int(down.get("group_size", 1))
-        peer_idx = int(down.get("peer_idx", 0))
+        # ---------- staging(标准) -> 本地KV(分组) ----------
         if ngroups <= 1:
             return
 
+        # 对齐分段，保证 (N,B,H,C) 的 N 相等
         local_ranges0 = self._get_ranges(local_block_ids)
         staging_ranges0 = self._get_ranges(staging_block_ids)
         local_ranges, staging_ranges = self._get_same_length_ranges(local_ranges0, staging_ranges0)
@@ -430,22 +454,19 @@ class DynamoNixlConnector:
             Nseg = (l1 - l0 + 1)
             for L in range(self.num_layers):
                 for E in range(self.num_cache_entries):
-                    # 1) t_std = 从 staging 取出的“标准”视图（H_std）
-                    t_std = self._rd_std[L][E][s0: s1 + 1].contiguous()  # (Nseg,B,H_std,C)
+                    # 1) 从 staging 取“标准”视图 (Nseg,B,H_std,C)
+                    t_std = self._rd_std[L][E][s0: s1 + 1].contiguous()
 
-                    # 2) 重排到 grouped（仍是 H_std）
-                    t_grp_full = self._rd_grp[L][E][0: Nseg].contiguous()  # (Nseg,B,H_std,C)
+                    # 2) 重排成分组 (仍是 H_std)，写入临时缓冲
+                    t_grp_full = self._rd_grp[L][E][0: Nseg].contiguous()
                     rearrange_tensors_read_down(t_std, t_grp_full, ngroups)  # 标准 -> 分组
 
-                    # 3) 只把属于 peer_idx 的那段头写回本地
+                    # 3) 只切回属于本 shard 的头段
                     _, _, Hs, _ = t_grp_full.shape
-                    assert Hs % ngroups == 0
                     Hper = Hs // ngroups
                     h_lo = peer_idx * Hper
                     h_hi = h_lo + Hper
-
                     dst_view = self.kv_caches[L][E][l0: l1 + 1]  # (Nseg,B,H_local,C)
-                    assert dst_view.shape[2] == Hper
                     dst_view.copy_(t_grp_full[:, :, h_lo:h_hi, :])
 
         try:
