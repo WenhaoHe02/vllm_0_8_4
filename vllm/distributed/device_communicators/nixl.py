@@ -25,7 +25,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from .kv_rearrange import rearrange_tensors, rearrange_tensors_read_down
+from .kv_rearrange import rearrange_tensors
 from contextlib import contextmanager
 from functools import lru_cache
 
@@ -209,110 +209,99 @@ class DynamoNixlConnector:
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
-            # 取对端 remote_rank（在该 engine 内部的 TP 槽位），用于句柄选择
             remote_rank = info["remote_rank"]
 
-            # ======= 早期强断言（防止“只预购建在 rank0”导致静默卡死）=======
-            # src handle
+            # 句柄就绪性强校验
             if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                msg = (
-                    f"[WRITE-DOWN] missing src token handle: "
-                    f"engine={self.engine_id} local_rank={self.rank} "
-                    f"src_keys={list(self.src_xfer_side_handles.keys())}"
-                )
-                logger.error(msg)
-                raise RuntimeError(msg)
-
-            # dst handle
+                raise RuntimeError(f"[WRITE-DOWN] missing src token handle (rank={self.rank})")
             if (dst_engine_id not in self.dst_xfer_side_handles or
-                remote_rank not in self.dst_xfer_side_handles[dst_engine_id] or
-                self.dst_xfer_side_handles[dst_engine_id][remote_rank] is None):
-                msg = (
-                    f"[WRITE-DOWN] missing dst token handle: "
-                    f"dst_engine={dst_engine_id} local_rank={self.rank} remote_rank={remote_rank} "
-                    f"dst_keys_top={list(self.dst_xfer_side_handles.keys())} "
-                    f"dst_keys_inner={list(self.dst_xfer_side_handles.get(dst_engine_id, {}).keys())}"
-                )
-                logger.error(msg)
-                raise RuntimeError(msg)
-
-            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "8192"))
-            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "4"))
-            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
+                    remote_rank not in self.dst_xfer_side_handles[dst_engine_id] or
+                    self.dst_xfer_side_handles[dst_engine_id][remote_rank] is None):
+                raise RuntimeError(f"[WRITE-DOWN] missing dst token handle (rank={self.rank} rr={remote_rank})")
 
             src_hdl = self.src_xfer_side_handles[1]
             dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
 
-            # block->token 展开（local / remote 各自展开，保证顺序一致）
-            token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
+            # token 展开（一次，复用到所有(层,entry)）
             token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
-            logger.info("[WRITE-DOWN] token_expand local=%d remote=%d remote_rank=%d", len(token_ids_local), len(token_ids_remote), remote_rank)
+            token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
+            Ntok = len(token_ids_local)
+            if Ntok == 0:
+                if info["notify_leader"]:
+                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][remote_rank],
+                                                 str(notify_msg) if isinstance(notify_msg, str) else str(notify_msg))
+                return
+            if len(token_ids_remote) != Ntok:
+                raise RuntimeError(f"[WRITE-DOWN] token len mismatch: local={Ntok} remote={len(token_ids_remote)}")
 
-            notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-            remote_agent = self._remote_agents[dst_engine_id][remote_rank]
-            is_leader = bool(info["notify_leader"])
+            # 每个 (层,entry) 的基址跨度（单位：token 索引）
+            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 本地（标准布局）: blocks * B
+            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])  # 远端（token 粒度单位数）
+
+            # 组批策略：把多个(层,entry) 合成一批，直到 IOV 上限
+            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
+            MAX_IOV = int(os.getenv("NIXL_MAX_IOV", "65532"))
+            MAX_INFLIGHT = int(os.getenv("NIXL_MAX_INFLIGHT", "16"))
+            # 一批最多可装多少个 (层,entry)
+            # total_iov_per_batch = Ntok * le_per_batch  <= MAX_IOV
+            le_per_batch = max(1, min(
+                int(os.getenv("NIXL_WRITE_LE_PER_REQ", "0")) or (MAX_IOV // max(1, Ntok)),
+                self.num_layers * self.num_cache_entries
+            ))
+
+            # 生成 (层,entry) 列表（保持原顺序：层 -> entry）
+            le_list = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
 
             inflight = []
             total_reqs = 0
-            last_req_args = None
+            is_leader = bool(info["notify_leader"])
+            notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
+            remote_agent = self._remote_agents[dst_engine_id][remote_rank]
 
-            per_entry_src = int(self.num_blocks) * int(self.block_size)
-            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
-            logger.debug("[WRITE-DOWN] per_entry src=%d dst=%d num_layers=%d num_entries=%d", per_entry_src, per_entry_dst, self.num_layers, self.num_cache_entries)
+            # 组内 barrier（可通过 NIXL_DOWN_BARRIER=0 关闭）
+            self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
 
-            segments = [(lo, hi, token_ids_local[lo:hi], token_ids_remote[lo:hi])
-                        for lo, hi in self._chunk_iter(len(token_ids_local), MAX_IOV)]
-            N = len(token_ids_local)
-            for layer in range(self.num_layers):
-                base_layer_src = layer * (self.num_cache_entries * per_entry_src)
-                base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
-                for entry in range(self.num_cache_entries):
+            # 批量发送：跨层合并，最后一批携带通知
+            for off in range(0, len(le_list), le_per_batch):
+                chunk = le_list[off: off + le_per_batch]
+                local_idx = []
+                remote_idx = []
+
+                for (layer, entry) in chunk:
+                    base_layer_src = layer * (self.num_cache_entries * per_entry_src)
+                    base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
                     base_entry_src = base_layer_src + entry * per_entry_src
                     base_entry_dst = base_layer_dst + entry * per_entry_dst
-                    for (lo, hi, seg_local, seg_remote) in segments:
-                        local_idx = [base_entry_src + t for t in seg_local]
-                        remote_idx = [base_entry_dst + t for t in seg_remote]
-                        last_req_args = (local_idx, remote_idx)
-                        if (hi < N) or (entry < self.num_cache_entries - 1) or (layer < self.num_layers - 1):
-                            h = self.nixl_wrapper.make_prepped_xfer(
-                                "WRITE",
-                                src_hdl, local_idx,
-                                dst_hdl, remote_idx,
-                                "",  # 中间批次不带通知
-                                backends=BACKENDS
-                            )
-                            self.nixl_wrapper.transfer(h)
-                            inflight.append(h)
-                            total_reqs += 1
-                            if len(inflight) >= MAX_INFLIGHT:
-                                self._wait_many(inflight)
-                                inflight.clear()
+
+                    # append 索引（避免 Python 循环过深，使用局部变量绑定）
+                    _ls = local_idx.extend
+                    _rs = remote_idx.extend
+                    _ls([base_entry_src + t for t in token_ids_local])
+                    _rs([base_entry_dst + t for t in token_ids_remote])
+
+                # 最后一批才带通知
+                piggy = notify_payload if (off + le_per_batch >= len(le_list)) and is_leader else ""
+                h = self.nixl_wrapper.make_prepped_xfer(
+                    "WRITE",
+                    src_hdl, local_idx,
+                    dst_hdl, remote_idx,
+                    piggy,
+                    backends=BACKENDS
+                )
+                self.nixl_wrapper.transfer(h)
+                inflight.append(h)
+                total_reqs += 1
+
+                if len(inflight) >= MAX_INFLIGHT:
+                    self._wait_many(inflight)
+                    inflight.clear()
 
             if inflight:
                 self._wait_many(inflight)
                 inflight.clear()
 
-            # 组内 barrier：只有 leader 等全员
-            self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
-
-            # 最后一批 piggyback 通知；极端 0-token 情况下仅发通知
-            if last_req_args is None:
-                if is_leader:
-                    logger.info("[NOTIF][DOWN-0tok] dst=%s remote_rank=%s key=%s", dst_engine_id, remote_rank, self._peek([notify_payload]))
-                    self.nixl_wrapper.send_notif(remote_agent, notify_payload)
-                return
-
-            local_idx, remote_idx = last_req_args
-            h_last = self.nixl_wrapper.make_prepped_xfer(
-                "WRITE",
-                src_hdl, local_idx,
-                dst_hdl, remote_idx,
-                notify_payload,
-                backends=BACKENDS
-            )
-            self.nixl_wrapper.transfer(h_last)
-            self._wait_many([h_last])
-            logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d", total_reqs + 1, MAX_IOV, MAX_INFLIGHT)
+            logger.info("[WRITE][DOWN] chunks=%d iov_per_req<=%d inflight<=%d le_per_req=%d Ntok=%d",
+                        total_reqs, MAX_IOV, MAX_INFLIGHT, le_per_batch, Ntok)
 
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         """
