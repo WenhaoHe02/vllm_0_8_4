@@ -31,6 +31,25 @@ from functools import lru_cache
 
 logger = init_logger(__name__)
 
+# ---------- A3: 二级 LRU 缓存的块->token 展开实现（按连续段 + block_size 做 key） ----------
+@lru_cache(maxsize=4096)
+def _expand_blocks_to_tokens_cached_key(ranges_key: tuple, B: int) -> Tuple[int, ...]:
+    """
+    将若干 [a,b] 的块区间展开为 token 索引（连续），并缓存。
+    注意把 block_size(B) 纳入 key，避免不同 B 造成错误复用。
+    """
+    if not ranges_key or B <= 0:
+        return tuple()
+    out = []
+    # 对于连续块 [a,b]，token 索引是 [a*B, (b+1)*B)
+    for a, b in ranges_key:
+        start = int(a) * B
+        end = (int(b) + 1) * B
+        # 追加连续区间
+        out.extend(range(start, end))
+    return tuple(out)
+
+
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
 try:
     from nixl._api import nixl_agent as NixlWrapper
@@ -82,6 +101,8 @@ class DynamoNixlConnector:
         self.num_layers = None
         self.num_blocks = None
         self.num_heads = None
+        self.block_size = None
+        self.head_dim = None
         self.block_len = None
         self.kv_caches = None
         self.kv_caches_base_addr = {}
@@ -105,10 +126,10 @@ class DynamoNixlConnector:
         self._tp_size[engine_id] = vllm_config.parallel_config.tensor_parallel_size
         self._is_mla = "deepseek" in vllm_config.model_config.architectures[0].lower()
 
-        self.block_size = None
-        self.head_dim = None
-
         self._downscale_info = {}
+
+        # A4: (层,entry) 列表缓存
+        self._le_list_cache = None
 
         # ---- engine_id fingerprinting (strict check) ----
         self._engine_fingerprint = {}  # engine_id -> fp
@@ -204,6 +225,25 @@ class DynamoNixlConnector:
                 out.extend(self._expand_seq(a, b - a + 1))
             return out
 
+    # ---------- A3: 二级 LRU：以连续段为 key 的展开 ----------
+    def _ranges_key(self, block_ids: List[int]) -> tuple:
+        rngs = self._get_ranges(block_ids)
+        return tuple((int(a), int(b)) for a, b in rngs)
+
+    def _expand_blocks_to_tokens_cached(self, block_ids: List[int]) -> List[int]:
+        """优先使用二级 LRU 缓存的块->token 展开。"""
+        if not block_ids:
+            return []
+        B = int(self.block_size)
+        rk = self._ranges_key(block_ids)
+        return list(_expand_blocks_to_tokens_cached_key(rk, B))
+
+    # ---------- A4: 缓存 (层,entry) 列表 ----------
+    def _get_le_list(self):
+        if self._le_list_cache is None:
+            self._le_list_cache = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
+        return self._le_list_cache
+
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         with self._timing.span("write_down"):
             info = self._downscale_info[dst_engine_id]
@@ -222,9 +262,9 @@ class DynamoNixlConnector:
             src_hdl = self.src_xfer_side_handles[1]
             dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
 
-            # token 展开（一次，复用到所有(层,entry)）
-            token_ids_local = self._expand_blocks_to_tokens(local_block_ids)
-            token_ids_remote = self._expand_blocks_to_tokens(remote_block_ids)
+            # ---------- A3: 使用缓存化的 token 展开 ----------
+            token_ids_local = self._expand_blocks_to_tokens_cached(local_block_ids)
+            token_ids_remote = self._expand_blocks_to_tokens_cached(remote_block_ids)
             Ntok = len(token_ids_local)
             if Ntok == 0:
                 if info["notify_leader"]:
@@ -235,8 +275,11 @@ class DynamoNixlConnector:
                 raise RuntimeError(f"[WRITE-DOWN] token len mismatch: local={Ntok} remote={len(token_ids_remote)}")
 
             # 每个 (层,entry) 的基址跨度（单位：token 索引）
-            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 本地（标准布局）: blocks * B
-            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])  # 远端（token 粒度单位数）
+            per_entry_src = int(self.num_blocks) * int(self.block_size)   # 本地（标准布局）: blocks * B
+            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])       # 远端（token 粒度单位数）
+
+            # ---------- A2: 同形同块快速路径 ----------
+            same_layout = (per_entry_src == per_entry_dst and remote_block_ids == local_block_ids)
 
             # 组批策略：把多个(层,entry) 合成一批，直到 IOV 上限
             BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
@@ -249,8 +292,8 @@ class DynamoNixlConnector:
                 self.num_layers * self.num_cache_entries
             ))
 
-            # 生成 (层,entry) 列表（保持原顺序：层 -> entry）
-            le_list = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
+            # ---------- A4: 复用 (层,entry) 列表 ----------
+            le_list = self._get_le_list()
 
             inflight = []
             total_reqs = 0
@@ -264,8 +307,18 @@ class DynamoNixlConnector:
             # 批量发送：跨层合并，最后一批携带通知
             for off in range(0, len(le_list), le_per_batch):
                 chunk = le_list[off: off + le_per_batch]
-                local_idx = []
-                remote_idx = []
+
+                # ---------- A1: 预分配并原地写入索引 ----------
+                n_le = len(chunk)
+                total_items = Ntok * n_le
+                local_idx = [0] * total_items
+                # remote_idx 仅在需要时构造
+                if not same_layout:
+                    remote_idx = [0] * total_items
+                pos = 0
+
+                _tls = token_ids_local  # 局部绑定，减少属性查找
+                _trs = token_ids_remote
 
                 for (layer, entry) in chunk:
                     base_layer_src = layer * (self.num_cache_entries * per_entry_src)
@@ -273,18 +326,19 @@ class DynamoNixlConnector:
                     base_entry_src = base_layer_src + entry * per_entry_src
                     base_entry_dst = base_layer_dst + entry * per_entry_dst
 
-                    # append 索引（避免 Python 循环过深，使用局部变量绑定）
-                    _ls = local_idx.extend
-                    _rs = remote_idx.extend
-                    _ls([base_entry_src + t for t in token_ids_local])
-                    _rs([base_entry_dst + t for t in token_ids_remote])
+                    # 内层紧凑循环：避免创建临时 list
+                    for j in range(Ntok):
+                        local_idx[pos] = base_entry_src + _tls[j]
+                        if not same_layout:
+                            remote_idx[pos] = base_entry_dst + _trs[j]
+                        pos += 1
 
                 # 最后一批才带通知
                 piggy = notify_payload if (off + le_per_batch >= len(le_list)) and is_leader else ""
                 h = self.nixl_wrapper.make_prepped_xfer(
                     "WRITE",
                     src_hdl, local_idx,
-                    dst_hdl, remote_idx,
+                    dst_hdl, (local_idx if same_layout else remote_idx),
                     piggy,
                     backends=BACKENDS
                 )
@@ -636,6 +690,9 @@ class DynamoNixlConnector:
                 self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
             )
 
+        # A4: 每次注册后，重置 (层,entry) 列表缓存
+        self._le_list_cache = None
+
         if _env_flag("NIXL_PUBLISH_SELF_MD", True):
             try:
                 self._persist_remote_md_cache(
@@ -667,6 +724,11 @@ class DynamoNixlConnector:
         for prefill_dst_xfer_side_handles in self.prefill_dst_xfer_side_handles.values():
             for prefill_dst_xfer_side_handle in prefill_dst_xfer_side_handles.values():
                 self.nixl_wrapper.release_dlist_handle(prefill_dst_xfer_side_handle)
+        # A3: 清理二级 LRU 缓存，避免长跑时内存占用
+        try:
+            _expand_blocks_to_tokens_cached_key.cache_clear()
+        except Exception:
+            pass
 
     def _get_ranges(self, block_ids: List[int]):
         ranges = []
