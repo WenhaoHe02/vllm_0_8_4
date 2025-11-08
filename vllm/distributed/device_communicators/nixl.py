@@ -244,38 +244,25 @@ class DynamoNixlConnector:
         return self._le_list_cache
 
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
-        """
-        强制单次提交（single submit）版：
-        - 始终构建一份全量 local_idx（必要时再构建 remote_idx），只提交一次。
-        - 仍保留细粒度计时：expand_tokens / barrier / build_idx / submit / wait_window。
-        - 同构布局时复用 local_idx 作为远端索引。
-        - 若 total token 为 0，仅发通知直接返回。
-        注：如果底层后端对 IOV 有硬/软上限，超限时可能走慢路径（但本实现按你的要求依然一次提交）。
-        """
         with self._timing.span("write_down"):
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
 
             remote_rank = info["remote_rank"]
 
-            # 句柄就绪性强校验
-            if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
-                raise RuntimeError(f"[WRITE-DOWN] missing src token handle (rank={self.rank})")
-            if (dst_engine_id not in self.dst_xfer_side_handles or
-                    remote_rank not in self.dst_xfer_side_handles[dst_engine_id] or
-                    self.dst_xfer_side_handles[dst_engine_id][remote_rank] is None):
-                raise RuntimeError(f"[WRITE-DOWN] missing dst token handle (rank={self.rank} rr={remote_rank})")
-
+            # 句柄检查
             src_hdl = self.src_xfer_side_handles[1]
             dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
+            if src_hdl is None or dst_hdl is None:
+                raise RuntimeError("[WRITE-DOWN] xfer handles not ready")
 
-            # ---- block -> token 连续段（半开区间），便于用 range() 生成索引 ----
+            # ====== 把 block → token 连续段（半开区间） ======
             def _to_token_ranges(block_ids: list[int]) -> list[tuple[int, int]]:
                 if not block_ids:
                     return []
                 B = int(self.block_size)
                 out = []
-                for a, b in self._get_ranges(block_ids):  # 合并连续 block
+                for a, b in self._get_ranges(block_ids):  # 折叠连续块
                     out.append((a * B, (b + 1) * B))
                 return out
 
@@ -283,81 +270,112 @@ class DynamoNixlConnector:
                 loc_ranges = _to_token_ranges(local_block_ids)
                 rem_ranges = _to_token_ranges(remote_block_ids)
 
+            # token 总数
             Ntok = sum(hi - lo for lo, hi in loc_ranges)
             is_leader = bool(info.get("notify_leader"))
             notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-
-            # 空写：直接发通知（不进 barrier / 不提交）
             if Ntok == 0:
                 if is_leader and notify_payload:
                     self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][remote_rank], notify_payload)
                 return
 
-            # 计算每 (层,entry) 的 token跨度
-            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 本地标准布局
-            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])  # 远端 token 粒度单位数
+            # ====== 每 (layer,entry) 的 token跨度 ======
+            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 标准布局：blocks * B
+            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])  # 目的（decode token 粒度单位数）
 
-            # 同构布局：两端连续段一一对应且长度相同 & 基础跨度一致
             same_layout = (
-                    per_entry_src == per_entry_dst and
-                    len(loc_ranges) == len(rem_ranges) and
-                    all((b1 - a1) == (b2 - a2) for (a1, b1), (a2, b2) in zip(loc_ranges, rem_ranges))
+                    per_entry_src == per_entry_dst
+                    and len(loc_ranges) == len(rem_ranges)
+                    and all((b1 - a1) == (b2 - a2) for (a1, b1), (a2, b2) in zip(loc_ranges, rem_ranges))
             )
 
-            # (layer, entry) 列表
-            if hasattr(self, "_get_le_list"):
-                le_list = self._get_le_list()
-            else:
-                le_list = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
+            le_list = self._get_le_list()
+            LxE = self.num_layers * self.num_cache_entries
 
-            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
+            # ====== 预生成 token 偏移（numpy.int32），减少 Python 循环 ======
+            import numpy as np
+            with self._timing.span("write_down.iov_elements"):
+                tok_off_loc = np.concatenate([np.arange(lo, hi, dtype=np.int32) for (lo, hi) in loc_ranges]) \
+                    if Ntok > 0 else np.empty((0,), dtype=np.int32)
+                if not same_layout:
+                    tok_off_rem = np.concatenate([np.arange(lo, hi, dtype=np.int32) for (lo, hi) in rem_ranges]) \
+                        if Ntok > 0 else np.empty((0,), dtype=np.int32)
+                else:
+                    tok_off_rem = tok_off_loc  # 直接复用
 
-            # 组内 barrier（按原语义；需要时可通过 NIXL_DOWN_BARRIER/NIXL_DOWN_WAIT_MS 外部控制）
+            # ====== 生成 (layer,entry) 的基址（numpy，向量化广播） ======
+            with self._timing.span("write_down.build_idx"):
+                base_src = np.empty((len(le_list),), dtype=np.int64)
+                base_dst = np.empty((len(le_list),), dtype=np.int64)
+                for i, (layer, entry) in enumerate(le_list):
+                    base_layer_src = layer * (self.num_cache_entries * per_entry_src)
+                    base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
+                    base_src[i] = base_layer_src + entry * per_entry_src
+                    base_dst[i] = base_layer_dst + entry * per_entry_dst
+
+            # ======（可选）按 token 窗口切段，减小单次 submit 的 iov 体量 ======
+            WIN = int(os.getenv("NIXL_WRITE_TOKEN_WINDOW", "0"))  # 0=不切；建议尝试 128/256
+            total_calls = 0
+            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else []
+            SKIP_MERGE = (os.getenv("NIXL_SKIP_DESC_MERGE", "1") != "0")  # 默认跳过 merge
+
+            # 便于日志的统计
+            total_iov = 0
+            submit_ns = 0
+
+            def _submit_window(lo_idx: int, hi_idx: int, is_last: bool):
+                nonlocal total_calls, total_iov, submit_ns
+
+                # 形状：(LxE, win) → 展平为 (LxE*win,)
+                loc_idx = (base_src[:, None] + tok_off_loc[lo_idx:hi_idx][None, :]).reshape(-1).astype(np.int32)
+                if same_layout:
+                    rem_idx = loc_idx
+                else:
+                    rem_idx = (base_dst[:, None] + tok_off_rem[lo_idx:hi_idx][None, :]).reshape(-1).astype(np.int32)
+
+                total_iov += int(loc_idx.size)
+
+                with self._timing.span("write_down.submit"):
+                    # 只在最后一窗携带通知
+                    piggy = (notify_payload if (is_leader and is_last and notify_payload) else "")
+                    h = self.nixl_wrapper.make_prepped_xfer(
+                        "WRITE",
+                        src_hdl, loc_idx,
+                        dst_hdl, rem_idx,
+                        piggy.encode() if isinstance(piggy, str) else piggy,
+                        backends=BACKENDS,
+                        skip_desc_merge=SKIP_MERGE,
+                    )
+                    # 记录后端 telemetry 里的 descCount/bytes（可视化诊断 iov 规模）
+                    try:
+                        tel = self.nixl_wrapper.get_xfer_telemetry(h)
+                        # 这一步不会阻塞，descCount/totalBytes 很有用
+                        # logger.debug("[TEL] desc=%d bytes=%d post_us=%d xfer_us=%d",
+                        #              tel.descCount, tel.totalBytes, tel.postDuration, tel.xferDuration)
+                    except Exception:
+                        pass
+
+                    # 立刻 post + 等待完成（单窗）
+                    self.nixl_wrapper.transfer(h)
+                    with self._timing.span("write_down.wait_window"):
+                        self._wait_many([h])
+
+                total_calls += 1
+
+            # 组内 barrier（耗时很小）
             with self._timing.span("write_down.barrier"):
                 self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"],
                                             is_leader)
 
-            # ---- 构建“一次提交”的全量索引 ----
-            with self._timing.span("write_down.build_idx"):
-                local_idx: list[int] = []
-                remote_idx: list[int] | None = None if same_layout else []
+            if WIN and WIN > 0:
+                for off in range(0, Ntok, WIN):
+                    _submit_window(off, min(off + WIN, Ntok), is_last=(off + WIN >= Ntok))
+            else:
+                _submit_window(0, Ntok, is_last=True)
 
-                _loc_ext = local_idx.extend
-                _rem_ext = (remote_idx.extend if remote_idx is not None else None)
-
-                for (layer, entry) in le_list:
-                    base_layer_src = layer * (self.num_cache_entries * per_entry_src)
-                    base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
-                    base_entry_src = base_layer_src + entry * per_entry_src
-                    base_entry_dst = base_layer_dst + entry * per_entry_dst
-
-                    for (lo, hi) in loc_ranges:
-                        _loc_ext(range(base_entry_src + lo, base_entry_src + hi))
-
-                    if remote_idx is not None:
-                        for (lo, hi) in rem_ranges:
-                            _rem_ext(range(base_entry_dst + lo, base_entry_dst + hi))
-
-            # ---- 单次提交 + 等待完成（携带通知仅一次）----
-            with self._timing.span("write_down.submit"):
-                h = self.nixl_wrapper.make_prepped_xfer(
-                    "WRITE",
-                    src_hdl, local_idx,
-                    dst_hdl, (local_idx if same_layout else remote_idx),
-                    (notify_payload if is_leader else ""),
-                    backends=BACKENDS
-                )
-                self.nixl_wrapper.transfer(h)
-
-            with self._timing.span("write_down.wait_window"):
-                self._wait_many([h])
-
-            # 诊断日志
-            LxE = self.num_layers * self.num_cache_entries
-            total_iov = len(local_idx)  # 如果同构，远端同规模
             logger.info(
-                "[WRITE][DOWN-SINGLE] submit_once=True same_layout=%s LxE=%d Ntok=%d total_iov=%d",
-                same_layout, LxE, Ntok, total_iov
+                "[WRITE][DOWN] submit_calls=%d same_layout=%s LxE=%d Ntok=%d total_iov=%d skip_merge=%s win=%s",
+                total_calls, same_layout, LxE, Ntok, total_iov, SKIP_MERGE, (WIN if WIN else "ALL"),
             )
 
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
