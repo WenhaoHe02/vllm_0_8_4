@@ -244,138 +244,378 @@ class DynamoNixlConnector:
         return self._le_list_cache
 
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
+        """
+        DOWN：组长聚合 + 少 IOV 一次下发（默认开启）
+          - NIXL_DOWN_GATHER=1（默认）且 group_size>1 时启用；
+          - 否则回退到本文件里你之前的“单次 submit（token 粒度预制 dlist）”实现。
+        """
+
+        # --------- 小工具（仅在本函数内）---------
+        def _ranges(ids):
+            if not ids: return []
+            out, s, p = [], ids[0], ids[0]
+            for x in ids[1:]:
+                if x == p + 1:
+                    p = x
+                else:
+                    out.append((s, p));
+                    s = p = x
+            out.append((s, p))
+            return out
+
+        def _pack_local_std(L: int, entry_idx: int, ranges):
+            # kv_caches[L][entry] 形状（非MLA）：[num_blocks, B, H_loc, C]
+            src = self.kv_caches[L][entry_idx]
+            parts = [src[a:b + 1].contiguous() for (a, b) in ranges]
+            return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0).contiguous()
+
+        def _persist_meta(dst_engine_id: str, key: str, group_size: int, peer_idx: int, meta: dict):
+            import os, msgspec, time
+            base = os.getenv("NIXL_BARRIER_DIR", "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp")
+
+            def _safe(s, n):
+                s = str(s);
+                r = []
+                for ch in s:
+                    if ch.isalnum() or ch in ("-", "_"): r.append(ch)
+                    if len(r) >= n: break
+                return "".join(r) or "k"
+
+            d = os.path.join(base, f"nixl_gather_{_safe(dst_engine_id, 16)}_{_safe(key, 24)}_{group_size}")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"{peer_idx}.msgpack")
+            b = msgspec.msgpack.encode(meta)
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.write(b)
+            os.replace(tmp, path)
+
+        def _load_all_meta(dst_engine_id: str, key: str, group_size: int, timeout_ms: int = 200):
+            import os, msgspec, time
+            base = os.getenv("NIXL_BARRIER_DIR", "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp")
+
+            def _safe(s, n):
+                s = str(s);
+                r = []
+                for ch in s:
+                    if ch.isalnum() or ch in ("-", "_"): r.append(ch)
+                    if len(r) >= n: break
+                return "".join(r) or "k"
+
+            d = os.path.join(base, f"nixl_gather_{_safe(dst_engine_id, 16)}_{_safe(key, 24)}_{group_size}")
+            metas = []
+            deadline = time.time() + timeout_ms / 1000.0
+            for i in range(group_size):
+                p = os.path.join(d, f"{i}.msgpack")
+                while not os.path.exists(p) and time.time() < deadline:
+                    time.sleep(0.001)
+                if not os.path.exists(p):
+                    raise RuntimeError(f"[DOWN-GATHER] missing meta for peer {i}")
+                with open(p, "rb") as f:
+                    metas.append(msgspec.msgpack.decode(f.read()))
+            return metas
+
+        def _remote_pool_index(engine_id: str, r_idx: int, layer: int, entry_idx: int) -> int:
+            # 先看 kv_caches_dev_ids
+            devs = self.kv_caches_dev_ids.get(engine_id)
+            if devs is not None:
+                try:
+                    return int(devs[r_idx][layer][entry_idx])
+                except Exception:
+                    pass
+            # 再看映射
+            s = os.getenv("NIXL_MAP_PREFILLWORKER", "").strip()
+            if s:
+                m = {}
+                for kv in s.split(","):
+                    kv = kv.strip()
+                    if not kv: continue
+                    a, b = (kv.split("->", 1) if "->" in kv else kv.split(":", 1))
+                    try:
+                        m[int(a.strip())] = int(b.strip())
+                    except:
+                        pass
+                if r_idx in m: return int(m[r_idx])
+            return 0
+
+        def _leader_merge(per_peer_K, per_peer_V, ngroups: int):
+            """把 per-peer 的 [N,B,H_loc,C] 按组拼成长条 grouped，再用 Triton 合并到 standard。"""
+            num_layers = len(per_peer_K[0])
+            N, B, H_loc, C = per_peer_K[0][0].shape
+            H_tot = H_loc * ngroups
+            K_std_layers, V_std_layers = [], []
+
+            # 组内顺序：允许通过 _down_peer_perm 自定义；否则 0..ng-1
+            perm = self._down_peer_perm(ngroups) if hasattr(self, "_down_peer_perm") else list(range(ngroups))
+            seg_elems = N * B * H_loc * C
+
+            for L in range(num_layers):
+                K_grp = torch.empty((N, B, H_tot, C), dtype=per_peer_K[0][L].dtype, device=per_peer_K[0][L].device)
+                V_grp = torch.empty_like(K_grp)
+                Kdst = K_grp.view(-1);
+                Vdst = V_grp.view(-1)
+                for g, real in enumerate(perm):
+                    Ksrc = per_peer_K[real][L].contiguous().view(-1)
+                    Vsrc = per_peer_V[real][L].contiguous().view(-1)
+                    Kdst[g * seg_elems:(g + 1) * seg_elems].copy_(Ksrc)
+                    Vdst[g * seg_elems:(g + 1) * seg_elems].copy_(Vsrc)
+                with self._timing.span("write_down.leader.kernel_merge"):
+                    K_std_layers.append(_grouped_to_standard(K_grp, ngroups))
+                    V_std_layers.append(_grouped_to_standard(V_grp, ngroups))
+            return K_std_layers, V_std_layers
+
+        def _build_descs_src(base_ptr: int, dev_id: int, bytes_per_block: int, ranges):
+            descs = []
+            off = 0
+            for a, b in ranges:
+                n = b - a + 1
+                descs.append((base_ptr + off, n * bytes_per_block, dev_id))
+                off += n * bytes_per_block
+            return descs
+
+        def _build_descs_dst(base_ptr: int, dev_id: int, bytes_per_block: int, ranges):
+            return [(base_ptr + a * bytes_per_block, (b - a + 1) * bytes_per_block, dev_id) for (a, b) in ranges]
+
+        # ========= 正式逻辑 =========
         with self._timing.span("write_down"):
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
-
             remote_rank = info["remote_rank"]
+            is_leader = bool(info.get("notify_leader"))
+            notify_key = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
 
-            # 句柄检查
-            src_hdl = self.src_xfer_side_handles[1]
-            dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
-            if src_hdl is None or dst_hdl is None:
-                raise RuntimeError("[WRITE-DOWN] xfer handles not ready")
+            # 句柄健全性
+            if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
+                raise RuntimeError(f"[WRITE-DOWN] missing src token handle (rank={self.rank})")
+            if (dst_engine_id not in self.dst_xfer_side_handles or
+                    remote_rank not in self.dst_xfer_side_handles[dst_engine_id] or
+                    self.dst_xfer_side_handles[dst_engine_id][remote_rank] is None):
+                raise RuntimeError(f"[WRITE-DOWN] missing dst token handle (rank={self.rank} rr={remote_rank})")
 
-            # ====== 把 block → token 连续段（半开区间） ======
+            loc_ranges = _ranges(local_block_ids)
+            rem_ranges = _ranges(remote_block_ids)
+            N_blocks = sum(b - a + 1 for a, b in loc_ranges)
+            if N_blocks == 0:
+                if is_leader and notify_key:
+                    self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][remote_rank], notify_key)
+                return
+
+            # 是否启用“组长聚合”
+            ngroups = int(info["group_size"])
+            use_gather = (os.getenv("NIXL_DOWN_GATHER", "1") != "0") and (ngroups > 1)
+
+            if use_gather:
+                # ========== 每个 peer 本机：打包 [N,B,H_loc,C] 到连续显存 + 写元数据 ==========
+                with self._timing.span("write_down.pack_local"):
+                    per_layer_K = [_pack_local_std(L, 0, loc_ranges) for L in range(self.num_layers)]
+                    per_layer_V = [_pack_local_std(L, 1, loc_ranges) for L in range(self.num_layers)]
+                    md = self.get_agent_metadata()
+                    meta = {
+                        "agent_md": bytes(md),
+                        "device": int(per_layer_K[0].get_device()),
+                        "dtype": str(per_layer_K[0].dtype),
+                        "N": int(N_blocks),
+                        "B": int(self.block_size),
+                        "H_loc": int(self.num_heads),
+                        "C": int(self.head_dim),
+                        "layers": [
+                            {
+                                "K_addr": int(per_layer_K[L].data_ptr()),
+                                "K_len": int(per_layer_K[L].numel() * per_layer_K[L].element_size()),
+                                "K_dev": int(per_layer_K[L].get_device()),
+                                "V_addr": int(per_layer_V[L].data_ptr()),
+                                "V_len": int(per_layer_V[L].numel() * per_layer_V[L].element_size()),
+                                "V_dev": int(per_layer_V[L].get_device()),
+                            }
+                            for L in range(self.num_layers)
+                        ],
+                    }
+                    _persist_meta(dst_engine_id, notify_key, ngroups, int(info["peer_idx"]), meta)
+
+                # 组内 barrier，保证所有 peers 已写 meta
+                with self._timing.span("write_down.barrier"):
+                    self._barrier_mark_and_wait(dst_engine_id, notify_key, ngroups, info["peer_idx"], is_leader)
+
+                # 非 leader：到此结束（不与 decode 直接通信）
+                if not is_leader:
+                    return
+
+                # ========== leader：读取所有 meta，拉取其他 peer 的大连片 ==========
+                with self._timing.span("write_down.leader.load_meta"):
+                    metas = _load_all_meta(dst_engine_id, notify_key, ngroups)
+
+                per_peer_K = [[None] * self.num_layers for _ in range(ngroups)]
+                per_peer_V = [[None] * self.num_layers for _ in range(ngroups)]
+                my_peer = int(info["peer_idx"])
+                for L in range(self.num_layers):
+                    per_peer_K[my_peer][L] = per_layer_K[L]
+                    per_peer_V[my_peer][L] = per_layer_V[L]
+
+                BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
+                inflight = []
+                # 拉取其他 peers（READ）
+                for g, m in enumerate(metas):
+                    if g == my_peer:
+                        continue
+                    peer_agent = self.nixl_wrapper.add_remote_agent(m["agent_md"])
+                    for L in range(self.num_layers):
+                        # 目标：leader 本机 [N,B,H_loc,C]
+                        N = int(m["N"]);
+                        B = int(m["B"]);
+                        H_loc = int(m["H_loc"]);
+                        C = int(m["C"])
+                        K_dst = torch.empty((N, B, H_loc, C), dtype=per_layer_K[0].dtype, device=per_layer_K[0].device)
+                        V_dst = torch.empty_like(K_dst)
+                        per_peer_K[g][L] = K_dst;
+                        per_peer_V[g][L] = V_dst
+
+                        # local dlist（dst）
+                        K_loc_desc = self.nixl_wrapper.get_xfer_descs(
+                            [(int(K_dst.data_ptr()), int(K_dst.numel() * K_dst.element_size()),
+                              int(K_dst.get_device()))], "VRAM")
+                        V_loc_desc = self.nixl_wrapper.get_xfer_descs(
+                            [(int(V_dst.data_ptr()), int(V_dst.numel() * V_dst.element_size()),
+                              int(V_dst.get_device()))], "VRAM")
+                        K_loc_h = self.nixl_wrapper.prep_xfer_dlist("", K_loc_desc, backends=BACKENDS)
+                        V_loc_h = self.nixl_wrapper.prep_xfer_dlist("", V_loc_desc, backends=BACKENDS)
+                        # remote dlist（src）
+                        row = m["layers"][L]
+                        K_rem_desc = self.nixl_wrapper.get_xfer_descs(
+                            [(int(row["K_addr"]), int(row["K_len"]), int(row["K_dev"]))], "VRAM")
+                        V_rem_desc = self.nixl_wrapper.get_xfer_descs(
+                            [(int(row["V_addr"]), int(row["V_len"]), int(row["V_dev"]))], "VRAM")
+                        K_rem_h = self.nixl_wrapper.prep_xfer_dlist(peer_agent, K_rem_desc, backends=BACKENDS)
+                        V_rem_h = self.nixl_wrapper.prep_xfer_dlist(peer_agent, V_rem_desc, backends=BACKENDS)
+                        # READ
+                        hK = self.nixl_wrapper.make_prepped_xfer("READ", K_loc_h, [0], K_rem_h, [0], b"",
+                                                                 backends=BACKENDS)
+                        hV = self.nixl_wrapper.make_prepped_xfer("READ", V_loc_h, [0], V_rem_h, [0], b"",
+                                                                 backends=BACKENDS)
+                        self.nixl_wrapper.transfer(hK);
+                        inflight.append(hK)
+                        self.nixl_wrapper.transfer(hV);
+                        inflight.append(hV)
+
+                if inflight:
+                    with self._timing.span("write_down.leader.wait_gather"):
+                        self._wait_many(inflight)
+                        inflight.clear()
+
+                # ========== leader：Triton 合并到 standard（H_tot = H_loc*ngroups） ==========
+                with self._timing.span("write_down.leader.merge"):
+                    K_std_layers, V_std_layers = _leader_merge(per_peer_K, per_peer_V, ngroups)
+
+                # ========== leader：按连续段 少 IOV 一次写到 decode ==========
+                with self._timing.span("write_down.leader.write_decode"):
+                    B = int(self.block_size)
+                    H_loc = int(self.num_heads)
+                    C = int(self.head_dim)
+                    e = self.kv_caches[0][0].element_size()
+                    H_tot = H_loc * ngroups
+                    token_len_total = H_tot * C * e
+                    bytes_per_block = B * token_len_total
+
+                    rr = remote_rank
+                    dst_agent = self._remote_agents[dst_engine_id][rr]
+                    for L in range(self.num_layers):
+                        for entry_idx, std in ((0, K_std_layers[L]), (1, V_std_layers[L])):
+                            src_ptr = int(std.data_ptr());
+                            src_dev = int(std.get_device())
+                            src_desc = _build_descs_src(src_ptr, src_dev, bytes_per_block, loc_ranges)
+                            src_xfer = self.nixl_wrapper.get_xfer_descs(src_desc, "VRAM")
+                            src_h = self.nixl_wrapper.prep_xfer_dlist("", src_xfer, backends=BACKENDS)
+
+                            base_decode = int(self.kv_caches_base_addr[dst_engine_id][rr][L][entry_idx])
+                            dst_dev = _remote_pool_index(dst_engine_id, rr, L, entry_idx)
+                            dst_desc = _build_descs_dst(base_decode, int(dst_dev), bytes_per_block, rem_ranges)
+                            dst_xfer = self.nixl_wrapper.get_xfer_descs(dst_desc, "VRAM")
+                            dst_h = self.nixl_wrapper.prep_xfer_dlist(dst_agent, dst_xfer, backends=BACKENDS)
+
+                            idx = list(range(len(src_desc)))
+                            h = self.nixl_wrapper.make_prepped_xfer(
+                                "WRITE",
+                                src_h, idx,
+                                dst_h, idx,
+                                (notify_key if (entry_idx == self.num_cache_entries - 1) else b""),
+                                backends=BACKENDS,
+                                skip_desc_merge=True,
+                            )
+                            self.nixl_wrapper.transfer(h)
+                            self._wait_many([h])
+                return
+
+            # ========== 回退路径：你原来的“单次 submit”实现 ==========
+            # ---- block -> token 连续段 ----
             def _to_token_ranges(block_ids: list[int]) -> list[tuple[int, int]]:
-                if not block_ids:
-                    return []
+                if not block_ids: return []
                 B = int(self.block_size)
                 out = []
-                for a, b in self._get_ranges(block_ids):  # 折叠连续块
+                for a, b in _ranges(block_ids):
                     out.append((a * B, (b + 1) * B))
                 return out
 
             with self._timing.span("write_down.expand_tokens"):
-                loc_ranges = _to_token_ranges(local_block_ids)
-                rem_ranges = _to_token_ranges(remote_block_ids)
+                loc_tok = _to_token_ranges(local_block_ids)
+                rem_tok = _to_token_ranges(remote_block_ids)
 
-            # token 总数
-            Ntok = sum(hi - lo for lo, hi in loc_ranges)
-            is_leader = bool(info.get("notify_leader"))
+            Ntok = sum(hi - lo for lo, hi in loc_tok)
             notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
             if Ntok == 0:
-                if is_leader and notify_payload:
+                if bool(info.get("notify_leader")) and notify_payload:
                     self.nixl_wrapper.send_notif(self._remote_agents[dst_engine_id][remote_rank], notify_payload)
                 return
 
-            # ====== 每 (layer,entry) 的 token跨度 ======
-            per_entry_src = int(self.num_blocks) * int(self.block_size)  # 标准布局：blocks * B
-            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])  # 目的（decode token 粒度单位数）
+            per_entry_src = int(self.num_blocks) * int(self.block_size)
+            per_entry_dst = int(self.dst_num_blocks[dst_engine_id])
+            same_layout = (per_entry_src == per_entry_dst and len(loc_tok) == len(rem_tok)
+                           and all((b1 - a1) == (b2 - a2) for (a1, b1), (a2, b2) in zip(loc_tok, rem_tok)))
 
-            same_layout = (
-                    per_entry_src == per_entry_dst
-                    and len(loc_ranges) == len(rem_ranges)
-                    and all((b1 - a1) == (b2 - a2) for (a1, b1), (a2, b2) in zip(loc_ranges, rem_ranges))
-            )
+            if hasattr(self, "_get_le_list"):
+                le_list = self._get_le_list()
+            else:
+                le_list = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
 
-            le_list = self._get_le_list()
-            LxE = self.num_layers * self.num_cache_entries
+            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
-            # ====== 预生成 token 偏移（numpy.int32），减少 Python 循环 ======
-            import numpy as np
-            with self._timing.span("write_down.iov_elements"):
-                tok_off_loc = np.concatenate([np.arange(lo, hi, dtype=np.int32) for (lo, hi) in loc_ranges]) \
-                    if Ntok > 0 else np.empty((0,), dtype=np.int32)
-                if not same_layout:
-                    tok_off_rem = np.concatenate([np.arange(lo, hi, dtype=np.int32) for (lo, hi) in rem_ranges]) \
-                        if Ntok > 0 else np.empty((0,), dtype=np.int32)
-                else:
-                    tok_off_rem = tok_off_loc  # 直接复用
-
-            # ====== 生成 (layer,entry) 的基址（numpy，向量化广播） ======
-            with self._timing.span("write_down.build_idx"):
-                base_src = np.empty((len(le_list),), dtype=np.int64)
-                base_dst = np.empty((len(le_list),), dtype=np.int64)
-                for i, (layer, entry) in enumerate(le_list):
-                    base_layer_src = layer * (self.num_cache_entries * per_entry_src)
-                    base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
-                    base_src[i] = base_layer_src + entry * per_entry_src
-                    base_dst[i] = base_layer_dst + entry * per_entry_dst
-
-            # ======（可选）按 token 窗口切段，减小单次 submit 的 iov 体量 ======
-            WIN = int(os.getenv("NIXL_WRITE_TOKEN_WINDOW", "0"))  # 0=不切；建议尝试 128/256
-            total_calls = 0
-            BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else []
-            SKIP_MERGE = (os.getenv("NIXL_SKIP_DESC_MERGE", "1") != "0")  # 默认跳过 merge
-
-            # 便于日志的统计
-            total_iov = 0
-            submit_ns = 0
-
-            def _submit_window(lo_idx: int, hi_idx: int, is_last: bool):
-                nonlocal total_calls, total_iov, submit_ns
-
-                # 形状：(LxE, win) → 展平为 (LxE*win,)
-                loc_idx = (base_src[:, None] + tok_off_loc[lo_idx:hi_idx][None, :]).reshape(-1).astype(np.int32)
-                if same_layout:
-                    rem_idx = loc_idx
-                else:
-                    rem_idx = (base_dst[:, None] + tok_off_rem[lo_idx:hi_idx][None, :]).reshape(-1).astype(np.int32)
-
-                total_iov += int(loc_idx.size)
-
-                with self._timing.span("write_down.submit"):
-                    # 只在最后一窗携带通知
-                    piggy = (notify_payload if (is_leader and is_last and notify_payload) else "")
-                    h = self.nixl_wrapper.make_prepped_xfer(
-                        "WRITE",
-                        src_hdl, loc_idx,
-                        dst_hdl, rem_idx,
-                        piggy.encode() if isinstance(piggy, str) else piggy,
-                        backends=BACKENDS,
-                        skip_desc_merge=SKIP_MERGE,
-                    )
-                    # 记录后端 telemetry 里的 descCount/bytes（可视化诊断 iov 规模）
-                    try:
-                        tel = self.nixl_wrapper.get_xfer_telemetry(h)
-                        # 这一步不会阻塞，descCount/totalBytes 很有用
-                        # logger.debug("[TEL] desc=%d bytes=%d post_us=%d xfer_us=%d",
-                        #              tel.descCount, tel.totalBytes, tel.postDuration, tel.xferDuration)
-                    except Exception:
-                        pass
-
-                    # 立刻 post + 等待完成（单窗）
-                    self.nixl_wrapper.transfer(h)
-                    with self._timing.span("write_down.wait_window"):
-                        self._wait_many([h])
-
-                total_calls += 1
-
-            # 组内 barrier（耗时很小）
             with self._timing.span("write_down.barrier"):
                 self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"],
-                                            is_leader)
+                                            bool(info.get("notify_leader")))
 
-            if WIN and WIN > 0:
-                for off in range(0, Ntok, WIN):
-                    _submit_window(off, min(off + WIN, Ntok), is_last=(off + WIN >= Ntok))
-            else:
-                _submit_window(0, Ntok, is_last=True)
+            with self._timing.span("write_down.build_idx"):
+                local_idx = [];
+                remote_idx = None if same_layout else []
+                _lex = local_idx.extend;
+                _rex = (remote_idx.extend if remote_idx is not None else None)
+                for (layer, entry) in le_list:
+                    base_layer_src = layer * (self.num_cache_entries * per_entry_src)
+                    base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
+                    base_entry_src = base_layer_src + entry * per_entry_src
+                    base_entry_dst = base_layer_dst + entry * per_entry_dst
+                    for (lo, hi) in loc_tok: _lex(range(base_entry_src + lo, base_entry_src + hi))
+                    if remote_idx is not None:
+                        for (lo, hi) in rem_tok: _rex(range(base_entry_dst + lo, base_entry_dst + hi))
 
-            logger.info(
-                "[WRITE][DOWN] submit_calls=%d same_layout=%s LxE=%d Ntok=%d total_iov=%d skip_merge=%s win=%s",
-                total_calls, same_layout, LxE, Ntok, total_iov, SKIP_MERGE, (WIN if WIN else "ALL"),
+            with self._timing.span("write_down.submit"):
+                src_hdl = self.src_xfer_side_handles[1]
+                dst_hdl = self.dst_xfer_side_handles[dst_engine_id][remote_rank]
+                h = self.nixl_wrapper.make_prepped_xfer(
+                    "WRITE",
+                    src_hdl, local_idx,
+                    dst_hdl, (local_idx if same_layout else remote_idx),
+                    (notify_payload if bool(info.get("notify_leader")) else ""),
+                    backends=BACKENDS
+                )
+                self.nixl_wrapper.transfer(h)
+
+            with self._timing.span("write_down.wait_window"):
+                self._wait_many([h])
+
+            LxE = self.num_layers * self.num_cache_entries
+            total_iov = len(local_idx)
+            import logging;
+            logging.getLogger(__name__).info(
+                "[WRITE][DOWN-SINGLE] submit_once=True same_layout=%s LxE=%d Ntok=%d total_iov=%d",
+                same_layout, LxE, Ntok, total_iov
             )
 
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):

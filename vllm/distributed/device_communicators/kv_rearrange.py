@@ -352,3 +352,54 @@ def rearrange_tensors_read_down(
         elems_per_token,
         BLOCK_SIZE=block_size_elements,
     )
+
+@triton.jit
+def _rearrange_kernel_write_down(
+    t_std_ptr, t_grp_ptr, N, B, H, C,
+    ngroups, tensor_subset_size, elems_per_block, elems_per_token,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid  = tl.program_id(0)
+    base = pid * BLOCK_SIZE
+    off  = base + tl.arange(0, BLOCK_SIZE)
+
+    total = N * elems_per_block
+    mask  = off < total
+
+    # 标准布局坐标
+    n = off // elems_per_block
+    b = (off // elems_per_token) % B
+    h = (off // C) % H
+    c = off % C
+
+    Hper = H // ngroups         # 每组头数
+    g   = (h * ngroups) // H    # 该头属于第几组
+    hin = h % Hper              # 组内头下标
+
+    # grouped 线性位置：按组拼接，每组内部仍是标准次序 (n,b,hin,c)
+    off_in_seg = n * (B * Hper * C) + b * (Hper * C) + hin * C + c
+    pos_grp    = g * tensor_subset_size + off_in_seg
+
+    val = tl.load(t_grp_ptr + pos_grp, mask=mask, other=0)
+    tl.store(t_std_ptr + off, val, mask=mask)
+
+def _grouped_to_standard(t_grouped: torch.Tensor, ngroups: int) -> torch.Tensor:
+    """将 shape=(N,B,H,C) 的 grouped 连续段合并成 standard；返回新 tensor。"""
+    assert t_grouped.ndim == 4 and ngroups > 0
+    N, B, H, C = t_grouped.shape
+    assert H % ngroups == 0, "H must be divisible by ngroups"
+    elems_per_block  = B * H * C
+    elems_per_token  = H * C
+    tensor_subset_sz = N * B * (H // ngroups) * C
+    total            = N * elems_per_block
+    BLOCK            = 1024
+    grid             = ((total + BLOCK - 1) // BLOCK,)
+
+    t_standard = torch.empty_like(t_grouped)
+    _rearrange_kernel_write_down[grid](
+        t_standard, t_grouped,
+        N, B, H, C, ngroups,
+        tensor_subset_sz, elems_per_block, elems_per_token,
+        BLOCK_SIZE=BLOCK
+    )
+    return t_standard
