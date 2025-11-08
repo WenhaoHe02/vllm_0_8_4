@@ -45,7 +45,6 @@ def _expand_blocks_to_tokens_cached_key(ranges_key: tuple, B: int) -> Tuple[int,
     for a, b in ranges_key:
         start = int(a) * B
         end = (int(b) + 1) * B
-        # 追加连续区间
         out.extend(range(start, end))
     return tuple(out)
 
@@ -299,7 +298,6 @@ class DynamoNixlConnector:
             total_reqs = 0
             is_leader = bool(info["notify_leader"])
             notify_payload = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
-            remote_agent = self._remote_agents[dst_engine_id][remote_rank]
 
             # 组内 barrier（可通过 NIXL_DOWN_BARRIER=0 关闭）
             self._barrier_mark_and_wait(dst_engine_id, notify_payload, info["group_size"], info["peer_idx"], is_leader)
@@ -308,30 +306,19 @@ class DynamoNixlConnector:
             for off in range(0, len(le_list), le_per_batch):
                 chunk = le_list[off: off + le_per_batch]
 
-                # ---------- A1: 预分配并原地写入索引 ----------
-                n_le = len(chunk)
-                total_items = Ntok * n_le
-                local_idx = [0] * total_items
-                # remote_idx 仅在需要时构造
+                # ---------- A1 回退：使用 list comprehension + extend（C 循环更快） ----------
+                local_idx = []
                 if not same_layout:
-                    remote_idx = [0] * total_items
-                pos = 0
-
-                _tls = token_ids_local  # 局部绑定，减少属性查找
-                _trs = token_ids_remote
-
+                    remote_idx = []
                 for (layer, entry) in chunk:
                     base_layer_src = layer * (self.num_cache_entries * per_entry_src)
                     base_layer_dst = layer * (self.num_cache_entries * per_entry_dst)
                     base_entry_src = base_layer_src + entry * per_entry_src
                     base_entry_dst = base_layer_dst + entry * per_entry_dst
 
-                    # 内层紧凑循环：避免创建临时 list
-                    for j in range(Ntok):
-                        local_idx[pos] = base_entry_src + _tls[j]
-                        if not same_layout:
-                            remote_idx[pos] = base_entry_dst + _trs[j]
-                        pos += 1
+                    local_idx.extend([base_entry_src + t for t in token_ids_local])
+                    if not same_layout:
+                        remote_idx.extend([base_entry_dst + t for t in token_ids_remote])
 
                 # 最后一批才带通知
                 piggy = notify_payload if (off + le_per_batch >= len(le_list)) and is_leader else ""
@@ -1485,7 +1472,6 @@ class DynamoNixlConnector:
                             for bid in range(self.num_blocks):
                                 base_block = base + bid * seg_len_local
                                 for t in range(B):
-                                    # 每个 token 一段连续拷
                                     blocks_local.append(
                                         (base_block + t * token_len_local, token_len_local, local_dev_id))
                     descs_local = self.nixl_wrapper.get_xfer_descs(blocks_local, "VRAM")
@@ -1510,7 +1496,6 @@ class DynamoNixlConnector:
                             for bid in range(num_blocks):
                                 base_block = rbase + bid * seg_len_total
                                 for t in range(B):
-                                    # 注意：远端以“每 token 全头”为步长，外加本 peer 的头切片偏移
                                     blocks_remote.append((base_block + t * token_len_total + peer_off,
                                                           token_len_local, r_pool_idx))
                     descs_remote = self.nixl_wrapper.get_xfer_descs(blocks_remote, "VRAM")
