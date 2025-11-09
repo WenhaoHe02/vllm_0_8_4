@@ -583,8 +583,8 @@ class DynamoNixlConnector:
         - 读完在本机做 standard->grouped 的 GPU 重排；支持按块再切小片降低显存峰值
           （通过 NIXL_READ_REARRANGE_CHUNK_BLOCKS 控制）
         """
-
         with self._timing.span("read_down"):
+            self._ensure_down_ready(dst_engine_id)
             down = self._downscale_info.get(dst_engine_id)
             assert down is not None, "[READ-DOWN] downscale info missing"
 
