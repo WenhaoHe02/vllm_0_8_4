@@ -243,6 +243,52 @@ class DynamoNixlConnector:
             self._le_list_cache = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
         return self._le_list_cache
 
+    def _ensure_down_ready(self, dst_engine_id: str) -> None:
+        """确保 DOWN 路的本地/远端句柄与元数据就绪；否则尝试从共享缓存收养并复检。"""
+
+        def _have_all() -> bool:
+            down = self._downscale_info.get(dst_engine_id)
+            if down is None:
+                return False
+            rr = down.get("remote_rank")
+            # 写入用的 token 句柄
+            if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
+                return False
+            if (dst_engine_id not in self.dst_xfer_side_handles or
+                    rr not in self.dst_xfer_side_handles[dst_engine_id] or
+                    self.dst_xfer_side_handles[dst_engine_id][rr] is None):
+                return False
+            if dst_engine_id not in self.dst_num_blocks:
+                return False
+            # 校验/READ-DOWN 需要的句柄
+            if ("read_down_src" not in self.src_xfer_side_handles or
+                    self.src_xfer_side_handles["read_down_src"] is None):
+                return False
+            if ("read_down_dst" not in self.dst_xfer_side_handles.get(dst_engine_id, {}) or
+                    self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is None):
+                return False
+            return True
+
+        with self._timing.span("write_down.ensure_ready"):
+            if not _have_all():
+                try:
+                    # 尝试从 /dev/shm|/tmp 的 msgpack 缓存“收养”，内部会调用 add_remote_agent(DOWN)
+                    self._adopt_remote_md_from_cache(dst_engine_id)
+                except Exception as e:
+                    logger.debug("[DOWN-ENSURE] adopt failed for %s: %s", dst_engine_id, e)
+            if not _have_all():
+                down = self._downscale_info.get(dst_engine_id)
+                rr = (down or {}).get("remote_rank")
+                raise RuntimeError(
+                    f"[DOWN-READY] not ready for dst={dst_engine_id}: "
+                    f"down={'Y' if down else 'N'} "
+                    f"src_tok={'Y' if 1 in self.src_xfer_side_handles else 'N'} "
+                    f"src_read={'Y' if 'read_down_src' in self.src_xfer_side_handles else 'N'} "
+                    f"dst_tok={'Y' if (dst_engine_id in self.dst_xfer_side_handles and rr in self.dst_xfer_side_handles[dst_engine_id]) else 'N'} "
+                    f"dst_read={'Y' if ('read_down_dst' in self.dst_xfer_side_handles.get(dst_engine_id, {})) else 'N'} "
+                    f"dst_nb={'Y' if dst_engine_id in self.dst_num_blocks else 'N'}"
+                )
+
     def _write_blocks_down(self, local_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         """
         Downscale (prefill -> decode) 写入：先在 prefill 侧按 group 内 all-gather/聚合，只有 leader( peer_idx==0 )
@@ -258,6 +304,7 @@ class DynamoNixlConnector:
         import torch.distributed as dist
 
         with self._timing.span("write_down"):
+            self._ensure_down_ready(dst_engine_id)
             # -------- 校验/准备 --------
             info = self._downscale_info[dst_engine_id]
             assert info is not None, "[WRITE-DOWN] downscale info missing"
