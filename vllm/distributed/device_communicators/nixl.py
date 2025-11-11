@@ -243,6 +243,58 @@ class DynamoNixlConnector:
             self._le_list_cache = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
         return self._le_list_cache
 
+    def _ensure_remote_md_ready(self, dst_engine_id: str) -> None:
+        """
+        在 read/write 使用 tp 之前确保已有 dst 的 tp_size。
+        先看内存缓存，再尝试从共享缓存收养（调用你已有的 _adopt_remote_md_from_cache）。
+        """
+        # 本地 tp 也顺便兜底一下，避免后面除法出 KeyError
+        if self.engine_id not in self._tp_size and hasattr(self, "_local_tp_size"):
+            self._tp_size[self.engine_id] = int(self._local_tp_size)
+
+        # 1) 已有就直接返回
+        tp = self._tp_size.get(dst_engine_id)
+        if isinstance(tp, int) and tp > 0:
+            return
+
+        # 2) engine_meta 里有（可能是 add_remote_agent 早先放进去的），取一遍
+        meta = getattr(self, "_engine_meta", {}).get(dst_engine_id)
+        if isinstance(meta, dict):
+            cand = meta.get("agent_tp") or meta.get("tp_size") or meta.get("tp")
+            if cand is not None:
+                try:
+                    self._tp_size[dst_engine_id] = int(cand)
+                    return
+                except Exception:
+                    pass
+
+        # 3) 尝试从共享缓存收养（你已经实现好的）
+        if hasattr(self, "_adopt_remote_md_from_cache"):
+            adopted = self._adopt_remote_md_from_cache(dst_engine_id)
+            if adopted:
+                # add_remote_agent 一般会把 tp 注入到内存结构；再检一次
+                tp2 = self._tp_size.get(dst_engine_id)
+                if isinstance(tp2, int) and tp2 > 0:
+                    return
+                # 退一步从 engine_meta 再拿一次
+                meta2 = getattr(self, "_engine_meta", {}).get(dst_engine_id)
+                if isinstance(meta2, dict):
+                    cand2 = meta2.get("agent_tp") or meta2.get("tp_size") or meta2.get("tp")
+                    if cand2 is not None:
+                        try:
+                            self._tp_size[dst_engine_id] = int(cand2)
+                            return
+                        except Exception:
+                            pass
+
+        # 4) 仍然没有就报出清晰错误
+        known = list(self._tp_size.keys())
+        raise RuntimeError(
+            f"[READ] missing tp_size for dst_engine={dst_engine_id}; "
+            f"known_tp_entries={known}. "
+            f"ensure metadata file exists and adoptable before first read."
+        )
+
     def _ensure_down_ready(self, dst_engine_id: str) -> None:
         """确保 DOWN 路的本地/远端句柄与元数据就绪；否则尝试从共享缓存收养并复检。"""
 
