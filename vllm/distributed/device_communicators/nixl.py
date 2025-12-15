@@ -179,7 +179,6 @@ class DynamoNixlConnector:
 
     def _wait_many(self, handles):
         with self._timing.span("wait_many"):
-            # 轻量轮询 + 退避
             spins, SPIN_MAX = 0, 2000
             sleep_us, SLEEP_MAX = 200, 2000
             pending = list(handles)
@@ -257,7 +256,7 @@ class DynamoNixlConnector:
         if isinstance(tp, int) and tp > 0:
             return
 
-        # 2) engine_meta 里有（可能是 add_remote_agent 早先放进去的），取一遍
+        # 2) engine_meta 里有，取一遍
         meta = getattr(self, "_engine_meta", {}).get(dst_engine_id)
         if isinstance(meta, dict):
             cand = meta.get("agent_tp") or meta.get("tp_size") or meta.get("tp")
@@ -272,7 +271,6 @@ class DynamoNixlConnector:
         if hasattr(self, "_adopt_remote_md_from_cache"):
             adopted = self._adopt_remote_md_from_cache(dst_engine_id)
             if adopted:
-                # add_remote_agent 一般会把 tp 注入到内存结构；再检一次
                 tp2 = self._tp_size.get(dst_engine_id)
                 if isinstance(tp2, int) and tp2 > 0:
                     return
@@ -350,9 +348,6 @@ class DynamoNixlConnector:
         仅在本函数内使用 NIXL 的 register_memory / prep_xfer_dlist / make_prepped_xfer。
         不改其他成员/流程；保留原 barrier（可通过 NIXL_DOWN_BARRIER=0 关闭）。
         """
-        import os
-        import time
-        import torch
         import torch.distributed as dist
 
         with self._timing.span("write_down"):
@@ -619,6 +614,17 @@ class DynamoNixlConnector:
 
                         # 下一批块
                         off = hi
+
+            # 关键：最后一个 chunk 里 leader 还要做 NIXL transfer+wait，
+            # follower 在最后一次 all_gather 后可能会直接退出。
+            # 加一个 final barrier 保证 follower 不会早于 leader 结束 write_down。
+            try:
+                if pg is not None:
+                    dist.barrier(group=pg)
+                else:
+                    dist.barrier()
+            except Exception as e:
+                logger.debug("[DOWN] final barrier skipped: %s", e)
 
             if is_leader:
                 logger.info(
@@ -1384,6 +1390,13 @@ class DynamoNixlConnector:
                                 self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
                         except Exception as e:
                             logger.warning("[DOWN-CHK] verify failed: %s", e)
+
+                    # 关键：DOWN 路径没有 NIXL handle 可追踪，但上层常用 get_done_transfers()
+                    # 来推进请求完成。这里用“空句柄列表”登记，表示本 rank 已完成。
+                    key = notify_msg if isinstance(notify_msg, str) else str(notify_msg)
+                    if key:
+                        self._transfers.setdefault(key, [])
+
                     logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
@@ -1543,7 +1556,6 @@ class DynamoNixlConnector:
         with self._timing.span("add_remote_agent"):
             agent_metadata = self._coerce_agent_metadata(agent_metadata)
 
-            # 记录对端 TP（每次都写，幂等）
             self._tp_size[engine_id] = int(agent_tp)
 
             pid = os.getpid()
@@ -1556,7 +1568,7 @@ class DynamoNixlConnector:
             logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
                         engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
-            # 严格 engine_id 复用检查（不同指纹报错/警告）
+            # 严格 engine_id 复用检查
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
             # 持久化元数据（便于同机其它 rank 采用）
@@ -1610,8 +1622,14 @@ class DynamoNixlConnector:
                         logger.warning("[MAP] skip invalid ints %r in %s", kv, env_name)
                 return out
 
+            # ✅ FIX: 这里必须接收 role；并且 role 优先读对应 pool env
             def _pool_len_for_role(role: str) -> int:
-                names = ["NIXL_POOL_VLLMWORKER", "NIXL_POOL_PREFILLWORKER", "NIXL_POOL"]
+                if role == "VLLMWORKER":
+                    names = ["NIXL_POOL_VLLMWORKER", "NIXL_POOL"]
+                elif role == "PREFILLWORKER":
+                    names = ["NIXL_POOL_PREFILLWORKER", "NIXL_POOL"]
+                else:
+                    names = ["NIXL_POOL"]
                 s = next((os.getenv(n) for n in names if os.getenv(n)), None)
                 if not s:
                     return 0
@@ -1855,7 +1873,8 @@ class DynamoNixlConnector:
 
     _last_done_log_ts = 0.0
 
-    def get_done_tranfers(self) -> List[str]:
+    # ✅ FIX: 正确拼写
+    def get_done_transfers(self) -> List[str]:
         with self._timing.span("get_done_transfers"):
             done_req_ids: List[str] = []
             for req_id, handles in list(self._transfers.items()):
@@ -1892,6 +1911,10 @@ class DynamoNixlConnector:
                     self._last_done_log_ts = now
 
             return done_req_ids
+
+    # backward-compatible alias (旧拼写)
+    def get_done_tranfers(self) -> List[str]:
+        return self.get_done_transfers()
 
     # -------- public timing API --------
     def get_timing(self, reset: bool = False):
