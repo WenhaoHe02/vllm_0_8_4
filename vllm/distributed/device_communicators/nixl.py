@@ -248,6 +248,44 @@ class DynamoNixlConnector:
             self._le_list_cache = [(L, E) for L in range(self.num_layers) for E in range(self.num_cache_entries)]
         return self._le_list_cache
 
+    # ✅ FIX: 预创建 DOWN fast-path 的 pg_map，确保 new_group 调用在所有 rank 上一致
+    def _ensure_down_pg_map(self, dst_engine_id: str) -> None:
+        """
+        对 DOWN fast-path（tp_src > tp_dst）：
+          - group_size = tp_src / tp_dst
+          - 必须保证 dist.new_group 在所有 rank 上以相同顺序、相同参数创建
+        这里按 world_size 的连续 rank 段预创建所有子组：
+          [0..group_size-1], [group_size..2*group_size-1], ...
+        并缓存到 info["pg_map"][base_rank]。
+        """
+        if os.getenv("NIXL_DOWN_PRECREATE_GROUPS", "1") == "0":
+            return
+        try:
+            import torch.distributed as dist
+            if not (dist.is_available() and dist.is_initialized()):
+                return
+            info = self._downscale_info.get(dst_engine_id)
+            if not info:
+                return
+            group_size = int(info.get("group_size", 1))
+            if group_size <= 1:
+                return
+            pg_map = info.get("pg_map")
+            if isinstance(pg_map, dict) and pg_map:
+                return
+
+            world = dist.get_world_size()
+            # world 应该是 prefill 侧 dist group 的 size（你说按 rank 排卡，prefill 通常就是 tp_src）
+            new_map = {}
+            for base in range(0, world, group_size):
+                ranks = list(range(base, min(base + group_size, world)))
+                new_map[base] = dist.new_group(ranks=ranks)
+            info["pg_map"] = new_map
+            logger.info("[DOWN][PG] precreated pg_map: world=%d group_size=%d bases=%s",
+                        world, group_size, list(new_map.keys()))
+        except Exception as e:
+            logger.warning("[DOWN][PG] precreate failed: %s", e)
+
     def _ensure_down_ready(self, dst_engine_id: str) -> None:
         def _have_all() -> bool:
             down = self._downscale_info.get(dst_engine_id)
@@ -386,7 +424,16 @@ class DynamoNixlConnector:
                     group_size, peer_idx, is_leader
                 )
 
-            use_fast_path = (group_size > 1) and hasattr(dist, "is_available") and dist.is_available() and dist.is_initialized()
+            # ✅ FIX: fast-path 必须依赖已预创建的 pg_map；否则退回 slow-path，避免 runtime new_group 失配
+            have_pg_map = isinstance(info.get("pg_map"), dict) and bool(info.get("pg_map"))
+            use_fast_path = (
+                group_size > 1
+                and hasattr(dist, "is_available")
+                and dist.is_available()
+                and dist.is_initialized()
+                and have_pg_map
+            )
+
             if not use_fast_path:
                 with self._timing.span("write_down.expand_tokens"):
                     token_ids_local = self._expand_blocks_to_tokens_cached(local_block_ids)
@@ -454,18 +501,30 @@ class DynamoNixlConnector:
                     except Exception as e:
                         logger.warning("[DOWN-NOTIF] explicit send_notif failed: %s", e)
 
+                # 在 _write_blocks_down() 的 fast-path 末尾（循环都结束后）
+                if is_leader:
+                    try:
+                        key = notify_msg if isinstance(notify_msg, (str, bytes)) else str(notify_msg)
+                        if isinstance(key, str):
+                            key_b = key.encode("utf-8")
+                        else:
+                            key_b = key
+                        ra = self._remote_agents[dst_engine_id][remote_rank]
+                        self.nixl_wrapper.send_notif(ra, key_b)
+                        logger.info("[DOWN][NOTIF] explicit send_notif to decode remote_rank=%d key=%r", remote_rank,
+                                    key)
+                    except Exception as e:
+                        logger.warning("[DOWN][NOTIF] explicit send_notif failed: %s", e)
+
                 return
 
+            # FAST-PATH：只用 pg_map，不 runtime new_group
             base_rank = (self.rank // group_size) * group_size
-            ranks_group = list(range(base_rank, base_rank + group_size))
-            pg = info.get("pg")
+            pg_map = info["pg_map"]
+            pg = pg_map.get(base_rank)
             if pg is None:
-                try:
-                    pg = dist.new_group(ranks=ranks_group)
-                    info["pg"] = pg
-                except Exception as e:
-                    logger.warning("[DOWN] new_group failed (%s), fallback to default group", e)
-                    pg = None
+                raise RuntimeError(f"[DOWN][PG] missing pg for base_rank={base_rank} group_size={group_size} "
+                                   f"pg_bases={list(pg_map.keys())}")
 
             ra_decode = self._remote_agents[dst_engine_id][remote_rank]
 
@@ -493,10 +552,7 @@ class DynamoNixlConnector:
 
                         with self._timing.span("write_down.gather"):
                             recv_list = [torch.empty_like(pack) for _ in range(group_size)]
-                            if pg is not None:
-                                dist.all_gather(recv_list, pack, group=pg)
-                            else:
-                                dist.all_gather(recv_list, pack)
+                            dist.all_gather(recv_list, pack, group=pg)
 
                         if is_leader:
                             gathered = torch.cat(recv_list, dim=1)
@@ -558,8 +614,8 @@ class DynamoNixlConnector:
 
             if is_leader:
                 logger.info(
-                    "[WRITE][DOWN-fast] leader rank=%d remote_rank=%d group=%s -> single-write per block/entry/layer",
-                    self.rank, remote_rank, ranks_group)
+                    "[WRITE][DOWN-fast] leader rank=%d remote_rank=%d group_size=%s base_rank=%d",
+                    self.rank, remote_rank, group_size, base_rank)
             else:
                 logger.info("[WRITE][DOWN-fast] follower rank=%d done (no decode write)", self.rank)
 
@@ -1454,14 +1510,7 @@ class DynamoNixlConnector:
             logger.debug("[TIMING] %s", stats)
         return stats
 
-    # -------------------- add_remote_agent（按你原版保留；你之前贴的内容太长，这里不再重复粘一遍） --------------------
-    # 你把你现有 add_remote_agent 原样放回这里即可（我上面用到的 _prep_dlist_retry / _normalize_kv_rows / self-md 已经修复）。
-    #
-    # ⚠️ 重要：如果你要我把 add_remote_agent 也“逐行合并成一个最终版本”，
-    # 你只需要回复一句“把 add_remote_agent 也合进去”，我会把它也完整贴出来，
-    # 但你当前这份对话里 add_remote_agent 已经在你原文件里存在且很长，我避免重复刷屏。
-    #
-    # -------------------- END --------------------
+    # -------------------- add_remote_agent（按你原版保留；仅在 DOWN 分支加一行 _ensure_down_pg_map） --------------------
     def add_remote_agent(
             self,
             engine_id: str,
@@ -1615,6 +1664,7 @@ class DynamoNixlConnector:
                     "notify_leader": (peer_idx == 0),
                     "perm": None,
                     "token_granularity": True,
+                    "pg_map": None,  # ✅ FIX: 预创建用
                 }
 
                 self.dst_num_blocks[engine_id] = num_blocks * B
@@ -1721,6 +1771,9 @@ class DynamoNixlConnector:
                 if not hasattr(self, "dst_num_blocks_read"):
                     self.dst_num_blocks_read = {}
                 self.dst_num_blocks_read[engine_id] = num_blocks
+
+                # ✅ FIX: 在初始化阶段预创建 pg_map（所有 rank 顺序一致）
+                self._ensure_down_pg_map(engine_id)
 
                 logger.info(
                     "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d src_keys=%s dst_keys=%s dst_units(token)=%s read_down_keys=%s",
