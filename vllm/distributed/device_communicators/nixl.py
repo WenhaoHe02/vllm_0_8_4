@@ -395,8 +395,10 @@ class DynamoNixlConnector:
                 notify_payload = notify_msg if isinstance(notify_msg, (str, bytes)) else str(notify_msg)
                 if info.get("notify_leader") and notify_payload:
                     ra = self._remote_agents[dst_engine_id][info["remote_rank"]]
-                    self.nixl_wrapper.send_notif(ra, notify_payload if isinstance(notify_payload, bytes)
-                    else notify_payload.encode("utf-8"))
+                    self.nixl_wrapper.send_notif(
+                        ra,
+                        notify_payload if isinstance(notify_payload, bytes) else notify_payload.encode("utf-8")
+                    )
                 return
 
             assert len(local_block_ids) == len(remote_block_ids), \
@@ -475,14 +477,24 @@ class DynamoNixlConnector:
 
             # -------- 组内 barrier（可通过 NIXL_DOWN_BARRIER=0 关闭） --------
             notify_payload = notify_msg if isinstance(notify_msg, (str, bytes)) else str(notify_msg)
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # ✅ FIX: 把 remote_rank 编进 barrier key，隔离 rr0/rr1 两组，避免互踩/互删 0.ok/1.ok
+            notify_key_str = notify_payload if isinstance(notify_payload, str) else str(notify_payload)
+            barrier_key = f"rr{remote_rank}_{notify_key_str}"
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
             with self._timing.span("write_down.barrier"):
-                self._barrier_mark_and_wait(dst_engine_id, (notify_payload if isinstance(notify_payload, str)
-                                                            else str(notify_payload)),
-                                            group_size, peer_idx, is_leader)
+                self._barrier_mark_and_wait(
+                    dst_engine_id,
+                    barrier_key,
+                    group_size,
+                    peer_idx,
+                    is_leader
+                )
 
             # -------- 判断是否可走“聚合→leader 单写”快路径 --------
-            use_fast_path = (group_size > 1) and hasattr(dist,
-                                                         "is_available") and dist.is_available() and dist.is_initialized()
+            use_fast_path = (group_size > 1) and hasattr(dist, "is_available") and dist.is_available() and dist.is_initialized()
             if not use_fast_path:
                 # ------- 回退：单次提交（token 粒度索引），但保持尽量少的控制面消耗 -------
                 with self._timing.span("write_down.expand_tokens"):
@@ -492,8 +504,10 @@ class DynamoNixlConnector:
                 if Ntok == 0:
                     if is_leader and notify_payload:
                         ra = self._remote_agents[dst_engine_id][remote_rank]
-                        self.nixl_wrapper.send_notif(ra, notify_payload if isinstance(notify_payload, bytes)
-                        else notify_payload.encode("utf-8"))
+                        self.nixl_wrapper.send_notif(
+                            ra,
+                            notify_payload if isinstance(notify_payload, bytes) else notify_payload.encode("utf-8")
+                        )
                     return
 
                 if 1 not in self.src_xfer_side_handles or self.src_xfer_side_handles[1] is None:
@@ -1371,7 +1385,7 @@ class DynamoNixlConnector:
                                 self._down_verify_peer_segment(dst_engine_id, remote_block_ids[0])
                         except Exception as e:
                             logger.warning("[DOWN-CHK] verify failed: %s", e)
-                    logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
+                    logger.info("[WRITE] end ok dst=%s (DOWN)")
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
                         if stats:
@@ -1453,7 +1467,7 @@ class DynamoNixlConnector:
                     if pending:
                         time.sleep(0.001)
 
-                logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
+                logger.info("[WRITE] end ok dst=%s (UP/EQ)")
                 if self._timing_autolog:
                     stats = self.get_timing(reset=True)
                     if stats:
