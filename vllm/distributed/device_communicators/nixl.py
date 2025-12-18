@@ -683,8 +683,6 @@ class DynamoNixlConnector:
             if inflight:
                 self._wait_many(inflight)
                 inflight.clear()
-            logger.info("[READ-DOWN] chunked_reqs=%d iov_per_req<=%d inflight<=%d",
-                        total_reqs, MAX_IOV_RD, MAX_INFLIGHT_RD)
 
             ngroups = int(down.get("group_size", 1))
             if ngroups <= 1 or self._is_mla:
@@ -696,7 +694,6 @@ class DynamoNixlConnector:
             except Exception:
                 H = None
             if not H or (H % ngroups != 0):
-                logger.warning("[READ-DOWN] skip rearrange: invalid H=%s for ngroups=%s (must divide).", H, ngroups)
                 return
 
             local_ranges = self._get_ranges(local_block_ids)
@@ -845,6 +842,8 @@ class DynamoNixlConnector:
         )
 
     def _adopt_remote_md_from_cache(self, engine_id: str) -> bool:
+        logger.info("[MD-CACHE][ADOPT] try engine=%s path=%s", engine_id, self._md_cache_path(engine_id))
+
         try:
             path = self._md_cache_path(engine_id)
             if not os.path.exists(path):
@@ -1270,6 +1269,10 @@ class DynamoNixlConnector:
                 wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
                 t0 = time.time()
                 last_missing = "unknown"
+                t_wait0 = time.time()
+                prev_missing = None
+                last_log_ts = 0.0
+                LOG_EVERY_MS = int(os.getenv("NIXL_READY_LOG_EVERY_MS", "50"))
 
                 while True:
                     if (dst_engine_id not in self._tp_size
@@ -1290,6 +1293,8 @@ class DynamoNixlConnector:
                                   self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
                         nb_ok = (dst_engine_id in self.dst_num_blocks)
                         if src_ok and dst_ok and nb_ok:
+                            logger.info("[WRITE][READY] dst=%s rank=%d READY waited_ms=%.1f",
+                                        dst_engine_id, self.rank, (time.time() - t_wait0) * 1000.0)
                             break
                         last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
                     else:
@@ -1315,7 +1320,12 @@ class DynamoNixlConnector:
                             except Exception as _e:
                                 logger.debug("[WRITE][ADOPT] late adopt failed for dst=%s: %s", dst_engine_id, _e)
                             last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has=True)"
-
+                    now = time.time()
+                    if last_missing != prev_missing or (now - last_log_ts) * 1000.0 >= LOG_EVERY_MS:
+                        logger.info("[WRITE][READY] dst=%s rank=%d waited_ms=%.1f state=%s",
+                                    dst_engine_id, self.rank, (now - t_wait0) * 1000.0, last_missing)
+                        prev_missing = last_missing
+                        last_log_ts = now
                     if (time.time() - t0) * 1000.0 > wait_ms:
                         raise RuntimeError(
                             f"[WRITE] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
