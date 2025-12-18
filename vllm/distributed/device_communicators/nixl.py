@@ -164,8 +164,6 @@ class DynamoNixlConnector:
             elif not same_tp:
                 logger.warning("[ENGCHK] same engine_id & same fingerprint but TP differs: engine_id=%s old_tp=%s new_tp=%s",
                                engine_id, self._engine_agent_tp.get(engine_id), agent_tp)
-        else:
-            logger.info("[ENGCHK] first time engine_id=%s fp=%s tp=%s", engine_id, fp[:12], agent_tp)
             self._engine_fingerprint[engine_id] = fp
             self._engine_agent_tp[engine_id] = int(agent_tp)
 
@@ -281,8 +279,6 @@ class DynamoNixlConnector:
                 ranks = list(range(base, min(base + group_size, world)))
                 new_map[base] = dist.new_group(ranks=ranks)
             info["pg_map"] = new_map
-            logger.info("[DOWN][PG] precreated pg_map: world=%d group_size=%d bases=%s",
-                        world, group_size, list(new_map.keys()))
         except Exception as e:
             logger.warning("[DOWN][PG] precreate failed: %s", e)
 
@@ -488,8 +484,6 @@ class DynamoNixlConnector:
                     self.nixl_wrapper.transfer(h)
                 with self._timing.span("write_down.wait_window"):
                     self._wait_many([h])
-                logger.info("[WRITE][DOWN-single-token] leader=%s Ntok=%d LxE=%d", is_leader,
-                            Ntok, self.num_layers * self.num_cache_entries)
 
                 # ✅ 兜底通知（避免 piggyback 丢）
                 if is_leader and notify_payload:
@@ -497,7 +491,6 @@ class DynamoNixlConnector:
                         ra = self._remote_agents[dst_engine_id][remote_rank]
                         payload_b = notify_payload if isinstance(notify_payload, bytes) else notify_payload.encode("utf-8")
                         self.nixl_wrapper.send_notif(ra, payload_b)
-                        logger.info("[DOWN-NOTIF] explicit send_notif ok key=%s", str(notify_payload)[:32])
                     except Exception as e:
                         logger.warning("[DOWN-NOTIF] explicit send_notif failed: %s", e)
 
@@ -511,8 +504,6 @@ class DynamoNixlConnector:
                             key_b = key
                         ra = self._remote_agents[dst_engine_id][remote_rank]
                         self.nixl_wrapper.send_notif(ra, key_b)
-                        logger.info("[DOWN][NOTIF] explicit send_notif to decode remote_rank=%d key=%r", remote_rank,
-                                    key)
                     except Exception as e:
                         logger.warning("[DOWN][NOTIF] explicit send_notif failed: %s", e)
 
@@ -608,16 +599,9 @@ class DynamoNixlConnector:
                     ra = self._remote_agents[dst_engine_id][remote_rank]
                     payload_b = notify_payload if isinstance(notify_payload, bytes) else notify_payload.encode("utf-8")
                     self.nixl_wrapper.send_notif(ra, payload_b)
-                    logger.info("[DOWN-NOTIF] explicit send_notif ok key=%s", str(notify_payload)[:32])
                 except Exception as e:
                     logger.warning("[DOWN-NOTIF] explicit send_notif failed: %s", e)
 
-            if is_leader:
-                logger.info(
-                    "[WRITE][DOWN-fast] leader rank=%d remote_rank=%d group_size=%s base_rank=%d",
-                    self.rank, remote_rank, group_size, base_rank)
-            else:
-                logger.info("[WRITE][DOWN-fast] follower rank=%d done (no decode write)", self.rank)
 
     def _read_blocks_down(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         with self._timing.span("read_down"):
@@ -842,7 +826,6 @@ class DynamoNixlConnector:
         )
 
     def _adopt_remote_md_from_cache(self, engine_id: str) -> bool:
-        logger.info("[MD-CACHE][ADOPT] try engine=%s path=%s", engine_id, self._md_cache_path(engine_id))
 
         try:
             path = self._md_cache_path(engine_id)
@@ -867,10 +850,8 @@ class DynamoNixlConnector:
                 num_blocks=int(data["num_blocks"]),
                 kv_caches_dev_ids=data.get("kv_caches_dev_ids"),
             )
-            logger.info("[MD-CACHE] adopted metadata for engine=%s", engine_id)
             return True
         except Exception as e:
-            logger.warning("[MD-CACHE] adopt failed for engine=%s: %s", engine_id, e)
             return False
 
     # -------------------- barrier --------------------
@@ -955,7 +936,6 @@ class DynamoNixlConnector:
                 kv_caches_dev_ids=local_dev_ids,
                 agent_tp=1,
             )
-            logger.info("[MD-CACHE][SELF] published engine=%s tp=1", self.engine_id)
             return
 
         # tp>1：尽量 gather 成完整 3D 后由 rank0 写
@@ -993,7 +973,6 @@ class DynamoNixlConnector:
                     kv_caches_dev_ids=None,
                     agent_tp=tp,
                 )
-                logger.info("[MD-CACHE][SELF] published engine=%s tp=%d (rank0 of tp-group)", self.engine_id, tp)
         except Exception as e:
             logger.warning("[MD-CACHE][SELF] publish tp=%d failed: %s", tp, e)
 
@@ -1050,11 +1029,6 @@ class DynamoNixlConnector:
             descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
             self.nixl_wrapper.register_memory(descs)
             self._registered_descs.append(descs)
-            logger.info(
-                "[KVREG] engine=%s layers=%d blocks=%d entries=%d block_len=%dB elem=%d heads=%s head_dim=%s block_size=%s",
-                self.engine_id, self.num_layers, self.num_blocks, self.num_cache_entries,
-                self.block_len, kv_caches[0].element_size(), self.num_heads, self.head_dim, self.block_size
-            )
 
         self._le_list_cache = None
 
@@ -1168,12 +1142,9 @@ class DynamoNixlConnector:
 
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         with self._timing.span("read_blocks"):
-            logger.info("[READ] local=%s staging=%s remote=%s dst_engine=%s",
-                        len(local_block_ids), len(staging_block_ids), len(remote_block_ids), dst_engine_id)
             assert len(local_block_ids) == len(staging_block_ids) == len(remote_block_ids), \
                 f"[READ] len mismatch: local={len(local_block_ids)} staging={len(staging_block_ids)} remote={len(remote_block_ids)}"
             if len(local_block_ids) == 0:
-                logger.info("[READ] no-op (0 blocks)")
                 return
 
             if self._is_mla:
@@ -1192,13 +1163,10 @@ class DynamoNixlConnector:
                 self._read_blocks_down(local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id)
                 if self._timing_autolog:
                     stats = self.get_timing(reset=True)
-                    if stats:
-                        logger.info("[TIMING][READ-DOWN] %s", stats)
                 return
             else:
                 eff_tp = max(1, tp_multiplier)
                 targets = list(range(eff_tp))
-                logger.info("[READ] tp_multiplier=%s eff_tp=%s targets=%s", tp_multiplier, eff_tp, targets)
 
             remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
             local_xfer_side_handle = self.src_xfer_side_handles[eff_tp]
@@ -1251,16 +1219,10 @@ class DynamoNixlConnector:
 
             if self._timing_autolog:
                 stats = self.get_timing(reset=True)
-                if stats:
-                    logger.info("[TIMING][READ] %s", stats)
 
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         with self._timing.span("write_blocks"):
             try:
-                logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
-                            dst_engine_id, len(local_block_ids), len(staging_block_ids),
-                            len(remote_block_ids), type(notify_msg).__name__)
-
                 assert len(staging_block_ids) == len(local_block_ids), \
                     f"[WRITE] len mismatch: staging={len(staging_block_ids)} local={len(local_block_ids)}"
                 assert len(remote_block_ids) == len(local_block_ids), \
@@ -1280,7 +1242,7 @@ class DynamoNixlConnector:
                             or not self.dst_xfer_side_handles.get(dst_engine_id)):
                         try:
                             if self._adopt_remote_md_from_cache(dst_engine_id):
-                                logger.info("[WRITE][ADOPT] adopted remote metadata for dst=%s", dst_engine_id)
+                                logger.debug("")
                         except Exception as _e:
                             logger.debug("[WRITE][ADOPT] adopt failed for dst=%s: %s", dst_engine_id, _e)
 
@@ -1293,8 +1255,6 @@ class DynamoNixlConnector:
                                   self.dst_xfer_side_handles[dst_engine_id][rr] is not None)
                         nb_ok = (dst_engine_id in self.dst_num_blocks)
                         if src_ok and dst_ok and nb_ok:
-                            logger.info("[WRITE][READY] dst=%s rank=%d READY waited_ms=%.1f",
-                                        dst_engine_id, self.rank, (time.time() - t_wait0) * 1000.0)
                             break
                         last_missing = f"down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok}, rr={rr})"
                     else:
@@ -1314,16 +1274,12 @@ class DynamoNixlConnector:
                                             f"tp_mult={tp_mult}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
                         else:
                             try:
-                                if self._adopt_remote_md_from_cache(dst_engine_id):
-                                    logger.info("[WRITE][ADOPT] late-adopted metadata for dst=%s", dst_engine_id)
                                     continue
                             except Exception as _e:
                                 logger.debug("[WRITE][ADOPT] late adopt failed for dst=%s: %s", dst_engine_id, _e)
                             last_missing = f"tp_size_missing(dst_has={tp_dst is not None}, src_has=True)"
                     now = time.time()
                     if last_missing != prev_missing or (now - last_log_ts) * 1000.0 >= LOG_EVERY_MS:
-                        logger.info("[WRITE][READY] dst=%s rank=%d waited_ms=%.1f state=%s",
-                                    dst_engine_id, self.rank, (now - t_wait0) * 1000.0, last_missing)
                         prev_missing = last_missing
                         last_log_ts = now
                     if (time.time() - t0) * 1000.0 > wait_ms:
@@ -1363,8 +1319,6 @@ class DynamoNixlConnector:
                     logger.info("[WRITE] end ok dst=%s (DOWN)", dst_engine_id)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
-                        if stats:
-                            logger.info("[TIMING][WRITE-DOWN] %s", stats)
                     return
 
                 # ---------------- UP/EQ ----------------
@@ -1387,11 +1341,8 @@ class DynamoNixlConnector:
                         trg = self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i]
                         key = _to_notify_str(notify_msg)
                         self.nixl_wrapper.send_notif(trg, key)
-                    logger.info("[WRITE] zero-block notify sent (tp=%s)", tp_multiplier)
                     if self._timing_autolog:
                         stats = self.get_timing(reset=True)
-                        if stats:
-                            logger.info("[TIMING][WRITE] %s", stats)
                     return
 
                 if do_rearrange:
@@ -1442,12 +1393,8 @@ class DynamoNixlConnector:
                     pending = nxt
                     if pending:
                         time.sleep(0.001)
-
-                logger.info("[WRITE] end ok dst=%s (UP/EQ)", dst_engine_id)
                 if self._timing_autolog:
                     stats = self.get_timing(reset=True)
-                    if stats:
-                        logger.info("[TIMING][WRITE] %s", stats)
 
             except Exception as e:
                 try:
@@ -1503,21 +1450,15 @@ class DynamoNixlConnector:
                 else:
                     self._transfers[req_id] = running
 
-            if done_req_ids:
-                logger.info("[DONE] report: count=%d keys=%s",
-                            len(done_req_ids), done_req_ids[:8])
             else:
                 now = time.time()
                 if now - getattr(self, "_last_done_log_ts", 0.0) > 1.0:
-                    logger.debug("[DONE] report: empty")
                     self._last_done_log_ts = now
 
             return done_req_ids
 
     def get_timing(self, reset: bool = False):
         stats = self._timing.snapshot(reset=reset)
-        if stats:
-            logger.debug("[TIMING] %s", stats)
         return stats
 
     # -------------------- add_remote_agent（按你原版保留；仅在 DOWN 分支加一行 _ensure_down_pg_map） --------------------
@@ -1545,10 +1486,6 @@ class DynamoNixlConnector:
                 dev = int(torch.cuda.current_device())
             except Exception:
                 dev = None
-            logger.info("[ADD][ENTER] pid=%s local_rank=%s cuda_dev=%s", pid, self.rank, dev)
-            logger.info("[ADD] num_blocks=%d dev_ids=%s", num_blocks, "Y" if kv_caches_dev_ids is not None else "N")
-            logger.info("[ADD] engine=%s local_rank=%s local_tp=%s agent_tp=%s is_mla=%s",
-                        engine_id, self.rank, self._tp_size[self.engine_id], agent_tp, self._is_mla)
 
             self._check_engine_id_reuse(engine_id, agent_metadata, agent_tp)
 
@@ -1632,10 +1569,7 @@ class DynamoNixlConnector:
                     return v
                 if _pool_len_hint:
                     v = r_idx % _pool_len_hint
-                    logger.info("[MAP][FALLBACK] %s not set for %d, fallback pool_index=%d (pool_len=%d)",
-                                ENV_MAP_NAME, r_idx, v, _pool_len_hint)
                     return v
-                logger.info("[MAP][FALLBACK] %s empty and pool_len unknown; use 0", ENV_MAP_NAME)
                 return 0
 
             if not self._engine_prepped.get(engine_id, False):
@@ -1643,15 +1577,9 @@ class DynamoNixlConnector:
                 for meta in agent_metadata:
                     agent_names.append(self.nixl_wrapper.add_remote_agent(meta))
                 self._remote_agents[engine_id] = agent_names
-                logger.info("[ADD] remote_agents registered: dst_engine=%s count=%d names_sample=%s",
-                            engine_id, len(agent_names), self._peek(agent_names, 3))
                 self._engine_prepped[engine_id] = True
-            else:
-                logger.info("[ADD][IDEMPOTENT] reuse remote_agents engine=%s", engine_id)
 
             tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
-            logger.info("[ADD] tp_multiplier=%s (dst_tp/src_tp = %s/%s)",
-                        tp_multiplier, self._tp_size[engine_id], self._tp_size[self.engine_id])
 
             # --------- DOWN（prefill -> decode，tp_multiplier == 0）---------
             if tp_multiplier == 0 and not self._is_mla:
@@ -1678,10 +1606,6 @@ class DynamoNixlConnector:
                 }
 
                 self.dst_num_blocks[engine_id] = num_blocks * B
-                logger.info(
-                    "[ADD][DOWN] group_size=%d remote_rank=%d peer_idx=%d token_len_local=%d token_len_total=%d full_len=%d seg_len=%d peer_off_tok=%d",
-                    group_size, remote_rank, peer_idx, token_len_local, token_len_total, full_len, seg_len,
-                    peer_off_tok)
 
                 BACKENDS = ["UCX"] if os.getenv("NIXL_FORCE_UCX", "1") == "1" else None
 
@@ -1785,19 +1709,11 @@ class DynamoNixlConnector:
                 # ✅ FIX: 在初始化阶段预创建 pg_map（所有 rank 顺序一致）
                 self._ensure_down_pg_map(engine_id)
 
-                logger.info(
-                    "[ADD][DOWN][READY] engine=%s local_rank=%d remote_rank=%d src_keys=%s dst_keys=%s dst_units(token)=%s read_down_keys=%s",
-                    engine_id, self.rank, remote_rank,
-                    list(self.src_xfer_side_handles.keys()),
-                    list(self.dst_xfer_side_handles[engine_id].keys()),
-                    self.dst_num_blocks[engine_id],
-                    list(self.dst_xfer_side_handles[engine_id].keys()))
                 return self._remote_agents[engine_id]
 
             # --------- UP / EQ（tp_multiplier > 0）---------
             assert tp_multiplier > 0, f"[ADD] invalid tp_multiplier={tp_multiplier}"
             dst_block_len = self.block_len if self._is_mla else (self.block_len // tp_multiplier)
-            logger.info("[ADD] up/equal path: dst_block_len=%s", dst_block_len)
 
             if tp_multiplier not in self.src_xfer_side_handles or self.src_xfer_side_handles[tp_multiplier] is None:
                 blocks_data = []
@@ -1834,11 +1750,6 @@ class DynamoNixlConnector:
                 except Exception as e:
                     logger.debug("make_connection lazy: %s", e)
 
-            logger.info("[ADD][UP][READY] engine=%s local_rank=%d src_keys=%s dst_keys=%s dst_num_blocks=%s",
-                        engine_id, self.rank,
-                        list(self.src_xfer_side_handles.keys()),
-                        list(self.dst_xfer_side_handles[engine_id].keys()),
-                        self.dst_num_blocks[engine_id])
             return self._remote_agents[engine_id]
 
 
